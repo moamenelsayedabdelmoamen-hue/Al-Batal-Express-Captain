@@ -91,7 +91,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         } else null
     }
     private var shiftDocListener: ListenerRegistration? = null
-    private var captainDocListener: ListenerRegistration? = null
+    private var accountStatusListener: ListenerRegistration? = null
     private var authStateListener: FirebaseAuth.AuthStateListener? = null
 
     val captainState: StateFlow<CaptainEntity?> = repository.captainFlow
@@ -1846,7 +1846,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
 
-        captainDocListener = dbFirestore.collection("captains").document(uid)
+        accountStatusListener = dbFirestore.collection("captains").document(uid)
             .addSnapshotListener { snapshot, error ->
                 if (error != null) {
                     Log.w("CaptainViewModel", "[CaptainDocListener] captains/$uid error: ${error.message}")
@@ -1862,8 +1862,8 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
     fun detachShiftSnapshotListeners() {
         shiftDocListener?.remove()
         shiftDocListener = null
-        captainDocListener?.remove()
-        captainDocListener = null
+        accountStatusListener?.remove()
+        accountStatusListener = null
         _liveShifts.value = emptyList()
         _hasLiveShiftSnapshot.value = false
         _shiftStatus.value = ShiftStatus.NoSchedule()
