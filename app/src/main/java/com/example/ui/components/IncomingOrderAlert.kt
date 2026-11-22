@@ -417,8 +417,8 @@ fun IncomingOrderOfferCardContent(
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         if (order.storeImage.isNotBlank()) {
-                            AsyncImage(
-                                model = order.storeImage,
+                            StorageAsyncImage(
+                                pathOrUrl = order.storeImage,
                                 contentDescription = "شعار التاجر",
                                 modifier = Modifier
                                     .size(36.dp)
