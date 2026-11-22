@@ -24,6 +24,9 @@ interface CaptainDao {
     @Query("UPDATE captain_profile SET isOnline = :isOnline WHERE id = 1")
     suspend fun updateOnlineStatus(isOnline: Boolean)
 
+    @Query("UPDATE captain_profile SET status = :status WHERE id = 1")
+    suspend fun updateAccountStatus(status: String)
+
     @Query("UPDATE captain_profile SET isLoggedIn = :isLoggedIn WHERE id = 1")
     suspend fun updateLoginState(isLoggedIn: Boolean)
 

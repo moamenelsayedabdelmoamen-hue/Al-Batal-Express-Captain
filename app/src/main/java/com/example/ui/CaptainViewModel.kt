@@ -90,6 +90,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         } else null
     }
     private var shiftDocListener: ListenerRegistration? = null
+    private var captainDocListener: ListenerRegistration? = null
     private var authStateListener: FirebaseAuth.AuthStateListener? = null
 
     val captainState: StateFlow<CaptainEntity?> = repository.captainFlow
@@ -593,6 +594,31 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         }
         // Set up real-time SnapshotListener on Firestore for captain shifts
         setupRealtimeShiftListener()
+    }
+
+    /**
+     * Applies an admin-side status change (approval, suspension) while the app is open.
+     * Without this the app kept the status it read at login until it was restarted.
+     */
+    private suspend fun onRemoteAccountStatus(remoteStatus: String) {
+        val local = captainState.value ?: repository.getCaptain() ?: return
+        val previous = local.status.trim().lowercase()
+        if (previous == remoteStatus) return
+        repository.applyRemoteAccountStatus(remoteStatus)
+        val app = getApplication<Application>()
+        when {
+            remoteStatus in BLOCKED_ACCOUNT_STATUSES -> {
+                CaptainNotificationManager.stopIncomingOrderBell(app)
+                if (local.isOnline) {
+                    CaptainLocationTracker.stopService(app)
+                    repository.setOnlineStatus(false)
+                }
+                _eventFlow.emit(UiEvent.ShowToast("تم إيقاف حسابك من الإدارة، ولن تصلك طلبات جديدة. تواصل مع الإدارة."))
+            }
+            remoteStatus !in INACTIVE_ACCOUNT_STATUSES && previous in INACTIVE_ACCOUNT_STATUSES -> {
+                _eventFlow.emit(UiEvent.ShowToast("تم تفعيل حسابك من الإدارة ✅ يمكنك الآن استقبال الطلبات."))
+            }
+        }
     }
 
     /**
@@ -1754,11 +1780,25 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                     )
                 }
             }
+
+        captainDocListener = dbFirestore.collection("captains").document(uid)
+            .addSnapshotListener { snapshot, error ->
+                if (error != null) {
+                    Log.w("CaptainViewModel", "[CaptainDocListener] captains/$uid error: ${error.message}")
+                    return@addSnapshotListener
+                }
+                val remoteStatus = snapshot?.takeIf { it.exists() }
+                    ?.getString("status")?.trim()?.lowercase()
+                    ?.takeIf { it.isNotBlank() } ?: return@addSnapshotListener
+                viewModelScope.launch { onRemoteAccountStatus(remoteStatus) }
+            }
     }
 
     fun detachShiftSnapshotListeners() {
         shiftDocListener?.remove()
         shiftDocListener = null
+        captainDocListener?.remove()
+        captainDocListener = null
         _liveShifts.value = emptyList()
         _hasLiveShiftSnapshot.value = false
         _shiftStatus.value = ShiftStatus.NoSchedule()
@@ -1774,6 +1814,9 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
     }
 
     companion object {
+        private val BLOCKED_ACCOUNT_STATUSES = setOf("banned", "suspended", "disabled", "blocked")
+        private val INACTIVE_ACCOUNT_STATUSES = BLOCKED_ACCOUNT_STATUSES + setOf("pending", "inactive")
+
         fun calculateDailyWorkHours(
             shifts: List<ShiftEntity>,
             nowCal: java.util.Calendar = ShiftManager.getCurrentCairoCalendar()

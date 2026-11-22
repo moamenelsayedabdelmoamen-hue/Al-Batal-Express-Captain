@@ -2856,6 +2856,11 @@ class CaptainRepository(
         }
     }
 
+    /** Mirrors an admin-side status change (approval, suspension) into the local profile. */
+    suspend fun applyRemoteAccountStatus(status: String) {
+        captainDao.updateAccountStatus(status)
+    }
+
     suspend fun setOnlineStatus(isOnline: Boolean) {
         if (isOnline && _accountApprovalState.value != null && !isCurrentSessionApproved) {
             captainDao.updateOnlineStatus(false)
