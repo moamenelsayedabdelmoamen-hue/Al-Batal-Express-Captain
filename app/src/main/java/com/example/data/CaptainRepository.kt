@@ -178,7 +178,14 @@ class CaptainRepository(
             override suspend fun reloadCurrentUser(): AuthUserSnapshot? {
                 val u = firebaseAuth.currentUser ?: return null
                 u.reload().await()
-                return firebaseAuth.currentUser?.toSnapshot() ?: u.toSnapshot()
+                val refreshed = firebaseAuth.currentUser ?: u
+                // reload() updates isEmailVerified locally, but Firestore keeps using the cached ID
+                // token (email_verified=false) for up to an hour. Force a new token once verified so
+                // the rules accept the follow-up emailVerified / isOnline write.
+                if (refreshed.isEmailVerified) {
+                    runCatching { refreshed.getIdToken(true).await() }
+                }
+                return refreshed.toSnapshot()
             }
 
             override suspend fun updateDisplayName(displayName: String) {
