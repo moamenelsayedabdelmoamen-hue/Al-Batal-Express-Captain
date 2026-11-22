@@ -2438,12 +2438,15 @@ class CaptainRepository(
         suspend fun rollbackOrMarkResumable(uid: String) {
             if (!createdAuthUser && uid != pendingIncompleteRegistrationUid) return
             // Remove this attempt's uploads first: Storage rules allow it only while the Auth user
-            // still exists and has no captains doc. Drop the cached paths so a resumed attempt re-uploads.
+            // still exists and has no captains doc. Forget only the files really deleted, so a resumed
+            // attempt re-uploads those and still reuses any upload that could not be removed.
             val uploadKeyPrefix = "$uid|"
             val uploadedForUid = pendingRegistrationUploadedPaths.filterKeys { it.startsWith(uploadKeyPrefix) }
             if (uploadedForUid.isNotEmpty()) {
-                runCatching { storageRepository.deleteRegistrationUploads(uid, uploadedForUid.values.toList()) }
-                uploadedForUid.keys.forEach { pendingRegistrationUploadedPaths.remove(it) }
+                val deleted = runCatching {
+                    storageRepository.deleteRegistrationUploads(uid, uploadedForUid.values.toList())
+                }.getOrDefault(emptySet())
+                uploadedForUid.filterValues { it in deleted }.keys.forEach { pendingRegistrationUploadedPaths.remove(it) }
             }
             val deleteResult = runCatching { authBackend.deleteCurrentUser() }
             if (deleteResult.isSuccess && authBackend.currentUser()?.uid != uid) {

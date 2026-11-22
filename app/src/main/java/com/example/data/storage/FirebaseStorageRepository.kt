@@ -79,7 +79,10 @@ interface StorageGateway {
     ): ByteArray
 
     /** Deletes an object; the default is a no-op so test gateways need not implement it. */
-    suspend fun delete(storagePath: String, requesterUid: String) {}
+    // Gateways that cannot delete report failure, so callers never assume a file is gone.
+    suspend fun delete(storagePath: String, requesterUid: String) {
+        throw UnsupportedOperationException("delete is not supported by this StorageGateway")
+    }
 }
 
 fun interface NetworkConnectivityChecker {
@@ -182,14 +185,16 @@ class FirebaseStorageRepository(
      * Best-effort removal of images uploaded during a sign-up that then failed, so they are not
      * left orphaned. Storage rules allow it only while captains/{uid} does not exist.
      */
-    suspend fun deleteRegistrationUploads(captainId: String, storagePaths: List<String>) {
+    suspend fun deleteRegistrationUploads(captainId: String, storagePaths: List<String>): Set<String> {
         val uid = captainId.trim()
-        storagePaths.map { normalizeStoragePath(it) }
-            .filter { it.startsWith("captains/$uid/") }
+        val deleted = mutableSetOf<String>()
+        storagePaths.filter { normalizeStoragePath(it).startsWith("captains/$uid/") }
             .forEach { path ->
-                runCatching { gateway.delete(path, uid) }
+                runCatching { gateway.delete(normalizeStoragePath(path), uid) }
+                    .onSuccess { deleted += path }
                     .onFailure { Log.w("FirebaseStorageRepo", "Could not remove orphaned upload $path: ${it.message}") }
             }
+        return deleted
     }
 
     /**
