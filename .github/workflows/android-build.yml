@@ -55,6 +55,15 @@ jobs:
           fi
       - name: Run Captain unit tests
         run: gradle :app:testDebugUnitTest
+      - name: Upload unit test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.repository.name }}-unit-test-reports
+          path: |
+            app/build/reports/tests/testDebugUnitTest
+            app/build/test-results/testDebugUnitTest
+          if-no-files-found: ignore
       - name: Build Captain debug APK
         run: gradle :app:assembleDebug
       - uses: actions/upload-artifact@v4
