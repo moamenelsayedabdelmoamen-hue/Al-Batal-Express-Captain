@@ -374,89 +374,19 @@ class CaptainRepository(
             }
         }
     }
-    private val merchantLocationCache = java.util.concurrent.ConcurrentHashMap<String, Triple<String, Double?, Double?>>()
 
-    private suspend fun lookupMerchantLocationFromFirestore(
+    /**
+     * Merchant account documents (merchants/, users/, and the retired restaurants/) are readable
+     * only by the merchant and admins, so a captain cannot look them up: every attempt was a
+     * PERMISSION_DENIED round trip. The server copies the store location onto the order itself
+     * (storeLocationUrl / pickup coordinates), which is what callers fall back to.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    private fun lookupMerchantLocationFromFirestore(
         merchantId: String,
         storeName: String,
         forceRefresh: Boolean
-    ): Triple<String, Double?, Double?> {
-        val cleanMerchantId = merchantId.trim()
-        val cleanStoreName = storeName.trim()
-        val cacheKey = if (cleanMerchantId.isNotBlank()) "id:$cleanMerchantId" else "name:$cleanStoreName"
-        if (!forceRefresh && cacheKey.isNotBlank()) {
-            merchantLocationCache[cacheKey]?.let { return it }
-        }
-
-        suspend fun extractFromDoc(doc: DocumentSnapshot?): Triple<String, Double?, Double?>? {
-            if (doc == null || !doc.exists()) return null
-            val url = extractMerchantLocationUrlFromFieldsMap(doc.data)
-            var lat: Double? = null
-            var lng: Double? = null
-            val geo = try {
-                doc.getGeoPoint("location") ?: doc.getGeoPoint("restaurant_location") ?: doc.getGeoPoint("pickup_location")
-            } catch (_: Exception) { null }
-            if (geo != null) {
-                lat = geo.latitude
-                lng = geo.longitude
-            } else {
-                lat = (doc.get("latitude") as? Number)?.toDouble()
-                    ?: (doc.get("lat") as? Number)?.toDouble()
-                    ?: (doc.get("restaurantLatitude") as? Number)?.toDouble()
-                lng = (doc.get("longitude") as? Number)?.toDouble()
-                    ?: (doc.get("lng") as? Number)?.toDouble()
-                    ?: (doc.get("restaurantLongitude") as? Number)?.toDouble()
-            }
-            return if (url.isNotBlank() || (lat != null && lng != null)) {
-                Triple(url, lat, lng)
-            } else {
-                null
-            }
-        }
-
-        var resolved: Triple<String, Double?, Double?>? = null
-        if (cleanMerchantId.isNotBlank()) {
-            for (collectionName in listOf("restaurants", "merchants", "users")) {
-                try {
-                    val doc = firestore.collection(collectionName).document(cleanMerchantId).get().await()
-                    val candidate = extractFromDoc(doc)
-                    if (candidate != null && candidate.first.isNotBlank()) {
-                        resolved = candidate
-                        break
-                    } else if (resolved == null && candidate != null) {
-                        resolved = candidate
-                    }
-                } catch (e: Exception) {
-                    Log.d("CaptainRepository", "[MerchantLocation] $collectionName/$cleanMerchantId lookup notice: ${e.message}")
-                }
-            }
-        }
-
-        if ((resolved == null || resolved.first.isBlank()) &&
-            cleanStoreName.isNotBlank() &&
-            cleanStoreName !in listOf("مطعم الشريك", "مطعم مسجل", "التاجر")
-        ) {
-            try {
-                val querySnap = firestore.collection("restaurants")
-                    .whereEqualTo("name", cleanStoreName)
-                    .limit(1)
-                    .get()
-                    .await()
-                val candidate = extractFromDoc(querySnap.documents.firstOrNull())
-                if (candidate != null && (candidate.first.isNotBlank() || resolved == null)) {
-                    resolved = candidate
-                }
-            } catch (e: Exception) {
-                Log.d("CaptainRepository", "[MerchantLocation] restaurants query by name notice: ${e.message}")
-            }
-        }
-
-        val finalTriple = resolved ?: Triple("", null, null)
-        if (cacheKey.isNotBlank() && finalTriple.first.isNotBlank()) {
-            merchantLocationCache[cacheKey] = finalTriple
-        }
-        return finalTriple
-    }
+    ): Triple<String, Double?, Double?> = Triple("", null, null)
 
     suspend fun resolveMerchantLocationForOrder(
         order: OrderEntity,
