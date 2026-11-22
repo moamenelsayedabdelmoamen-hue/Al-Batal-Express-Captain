@@ -566,7 +566,8 @@ class CaptainRepository(
 
     fun startRealtimeOrdersListener() {
         stopRealtimeOrdersListener()
-        val currentUser = firebaseAuth.currentUser
+        // Same guard as startRealtimeShiftListener: FirebaseAuth throws if Firebase is not initialized.
+        val currentUser = runCatching { firebaseAuth.currentUser }.getOrNull()
         if (currentUser == null) {
             Log.d("CaptainRepository", "[FirestoreOrdersListener] Waiting for captain authentication before starting orders listener")
             return
