@@ -1,0 +1,25 @@
+<resources>
+    <string name="app_name">البطل أكسبريس كابتن</string>
+    <string name="approval_logo_desc">شعار البطل إكسبريس</string>
+    <string name="approval_current_status_prefix">حالة الطلب: %1$s</string>
+    <string name="approval_badge_pending">قيد المراجعة</string>
+    <string name="approval_badge_rejected">مرفوض</string>
+    <string name="approval_badge_suspended">موقوف مؤقتاً</string>
+    <string name="approval_badge_blocked">محظور</string>
+    <string name="approval_badge_network_error">تعذر الاتصال</string>
+    <string name="approval_pending_title">حسابك قيد المراجعة</string>
+    <string name="approval_pending_body">تم استلام بياناتك بنجاح، وسيتمكن فريق الإدارة من مراجعتها. ستتمكن من استخدام التطبيق بعد الموافقة على حسابك.</string>
+    <string name="approval_rejected_title">تم رفض طلب تفعيل الحساب</string>
+    <string name="approval_rejected_body">نعتذر، لم تتم الموافقة على طلب انضمامك من قبل فريق الإدارة. يمكنك مراجعة السبب أدناه أو التواصل مع إدارة البطل إكسبريس.</string>
+    <string name="approval_suspended_title">تم إيقاف حسابك مؤقتاً</string>
+    <string name="approval_suspended_body">تم إيقاف حسابك بقرار إداري ولا يمكنك استخدام التطبيق حالياً. يرجى التواصل مع إدارة البطل إكسبريس للمتابعة.</string>
+    <string name="approval_blocked_title">تم حظر الحساب بقرار إداري</string>
+    <string name="approval_blocked_body">تم حظر هذا الحساب بقرار من الإدارة ولا يمكنك الدخول إلى التطبيق. يرجى التواصل مع إدارة البطل إكسبريس.</string>
+    <string name="approval_network_error_title">تعذر التحقق من حالة الحساب</string>
+    <string name="approval_network_error_body">يرجى التأكد من اتصال الإنترنت ثم الضغط على تحديث حالة الحساب. لا يمكن الدخول للتطبيق قبل التحقق من موافقة الإدارة.</string>
+    <string name="approval_reason_label">سبب القرار الإداري</string>
+    <string name="approval_auto_refresh_hint">سيتم فتح التطبيق تلقائياً فور موافقة الإدارة على حسابك.</string>
+    <string name="approval_refresh_button">تحديث حالة الحساب</string>
+    <string name="approval_refreshing_label">جاري التحقق من الخادم...</string>
+    <string name="approval_logout_button">تسجيل الخروج</string>
+</resources>
