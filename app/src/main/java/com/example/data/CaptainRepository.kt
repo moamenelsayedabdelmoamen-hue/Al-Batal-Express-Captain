@@ -518,8 +518,10 @@ class CaptainRepository(
     }
 
     suspend fun syncFcmToken() {
-        val uid = authBackend.currentUser()?.uid?.takeIf { it.isNotBlank() }
-            ?: cloudMetadataPort.currentAuthUid()?.takeIf { it.isNotBlank() }
+        // Best-effort: never throw if Firebase is not initialized (no google-services.json,
+        // or a live approval update arriving before startup finished).
+        val uid = runCatching { authBackend.currentUser()?.uid }.getOrNull()?.takeIf { it.isNotBlank() }
+            ?: runCatching { cloudMetadataPort.currentAuthUid() }.getOrNull()?.takeIf { it.isNotBlank() }
             ?: return
         val token = runCatching { FirebaseMessaging.getInstance().token.await() }.getOrNull()
             ?: context?.let { CaptainNotificationManager.getSavedFcmToken(it) }
