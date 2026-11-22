@@ -592,8 +592,43 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                     }
                 }
         }
+        // The location service is not restarted by Android after the app is killed or the captain
+        // logs in while already marked online, so GPS went stale until the switch was toggled.
+        // Wait for the startup session check: the cached profile can say "logged in" for a session
+        // that check then rejects, and tracking must stop again when that happens.
+        viewModelScope.launch {
+            combine(captainState, _hasCompletedIntroSplash) { captain, sessionChecked ->
+                if (!sessionChecked) null else captain != null && captain.isLoggedIn && captain.isOnline
+            }
+                .distinctUntilChanged()
+                .collect { shouldTrack ->
+                    when (shouldTrack) {
+                        true -> resumeLocationTrackingIfNeeded()
+                        false -> if (CaptainLocationTracker.isTracking.value) {
+                            CaptainLocationTracker.stopService(getApplication())
+                        }
+                        null -> Unit
+                    }
+                }
+        }
         // Set up real-time SnapshotListener on Firestore for captain shifts
         setupRealtimeShiftListener()
+    }
+
+    private fun resumeLocationTrackingIfNeeded() {
+        val app = getApplication<Application>()
+        if (CaptainLocationTracker.isTracking.value) return
+        if (auth?.currentUser?.isEmailVerified != true) return
+        if (!CaptainLocationTracker.hasLocationPermission(app)) {
+            viewModelScope.launch { _eventFlow.emit(UiEvent.RequestLocationPermission) }
+            return
+        }
+        if (!CaptainLocationTracker.isGpsProviderEnabled(app)) {
+            viewModelScope.launch { _eventFlow.emit(UiEvent.RequestGpsEnable) }
+            return
+        }
+        runCatching { CaptainLocationTracker.startService(app) }
+            .onFailure { Log.w("CaptainViewModel", "Could not resume location service: ${it.message}") }
     }
 
     /**
