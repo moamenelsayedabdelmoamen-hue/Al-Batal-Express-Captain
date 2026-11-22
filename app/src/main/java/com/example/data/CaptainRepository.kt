@@ -2778,6 +2778,7 @@ class CaptainRepository(
 
     private var lastUploadedLocation: Location? = null
     private var lastLocationUploadTimestamp: Long = 0L
+    private var lastUploadedPresence: String? = null
 
     suspend fun updateCaptainGpsLocation(location: Location) {
         if (_accountApprovalState.value != null && !isCurrentSessionApproved) return
@@ -2791,13 +2792,16 @@ class CaptainRepository(
         val distance = if (lastLoc != null) location.distanceTo(lastLoc) else Float.MAX_VALUE
         val timeDiff = now - lastLocationUploadTimestamp
 
-        // Smart Throttling: send only if moved >= MIN_DISPLACEMENT_METERS or heartbeat interval elapsed
-        if (lastLoc != null && distance < GpsConfig.MIN_DISPLACEMENT_METERS && timeDiff < GpsConfig.FIRESTORE_HEARTBEAT_INTERVAL_MS) {
-            return
-        }
-
         val activeOrder = activeOrderFlow.firstOrNull()
         val presenceValue = if (activeOrder != null) "on_trip" else "available"
+
+        // Smart Throttling: send only if moved >= MIN_DISPLACEMENT_METERS, the heartbeat interval elapsed,
+        // or the trip state changed (a stale "on_trip" keeps the captain out of dispatch).
+        if (lastLoc != null && distance < GpsConfig.MIN_DISPLACEMENT_METERS &&
+            timeDiff < GpsConfig.FIRESTORE_HEARTBEAT_INTERVAL_MS && presenceValue == lastUploadedPresence
+        ) {
+            return
+        }
 
         val locationData = hashMapOf<String, Any>(
             "location" to GeoPoint(location.latitude, location.longitude),
@@ -2818,6 +2822,7 @@ class CaptainRepository(
             firestore.collection("captains").document(uid).update(locationData).await()
             lastUploadedLocation = location
             lastLocationUploadTimestamp = now
+            lastUploadedPresence = presenceValue
             Log.d("CaptainRepository", "Uploaded GPS location to Firestore for captain $uid: ${location.latitude}, ${location.longitude}")
         } catch (e: Exception) {
             Log.e("CaptainRepository", "Error uploading GPS location to Firestore", e)
