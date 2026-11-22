@@ -330,6 +330,44 @@ object CaptainNotificationManager {
     }
 
     @SuppressLint("MissingPermission")
+    fun showActiveOrderCancelledNotification(
+        context: Context,
+        orderKey: String,
+        storeName: String,
+        orderCode: String = "",
+        reason: String = ""
+    ): Boolean {
+        ensureNotificationChannels(context)
+        if (!hasNotificationPermission(context)) return false
+
+        val body = buildActiveOrderCancelledMessage(storeName, orderCode, reason)
+        val notifId = 51_000 + (kotlin.math.abs(orderKey.ifBlank { storeName }.hashCode()) % 1000)
+
+        val notification = NotificationCompat.Builder(context, CHANNEL_NEW_ORDERS_ID)
+            .setSmallIcon(resolveNotificationIcon())
+            .setContentTitle("تم إلغاء الطلب")
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .build()
+
+        return try {
+            NotificationManagerCompat.from(context).notify(notifId, notification)
+            true
+        } catch (_: SecurityException) {
+            false
+        }
+    }
+
+    fun buildActiveOrderCancelledMessage(storeName: String, orderCode: String, reason: String): String {
+        val cleanOrderCode = orderCode.trim().trimStart('#').trim()
+        val label = if (cleanOrderCode.isNotBlank()) "الطلب ($cleanOrderCode)" else "الطلب من $storeName"
+        val reasonPart = reason.trim().takeIf { it.isNotBlank() }?.let { " السبب: $it" }.orEmpty()
+        return "تم إلغاء $label ولم يعد عليك توصيله.$reasonPart"
+    }
+
+    @SuppressLint("MissingPermission")
     fun showShiftStartNotification(
         context: Context,
         dayNameArabic: String,

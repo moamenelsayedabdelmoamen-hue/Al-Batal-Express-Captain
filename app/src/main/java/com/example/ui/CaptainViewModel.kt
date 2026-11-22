@@ -44,6 +44,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -591,6 +592,35 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                         repository.syncOrdersDetailedFromFirestore()
                     }
                 }
+        }
+        // Tell the captain when the trip they were on is cancelled (merchant or admin); before, the
+        // trip just vanished from the screen with no explanation.
+        viewModelScope.launch {
+            var previousActiveKey: String? = null
+            activeOrder.collect { current ->
+                val currentKey = current?.firestoreDocId?.ifBlank { current.id.toString() }
+                val endedKey = previousActiveKey
+                previousActiveKey = currentKey
+                if (endedKey == null || endedKey == currentKey) return@collect
+                val ended = repository.allOrdersFlow.first().find {
+                    it.firestoreDocId == endedKey || it.id.toString() == endedKey
+                } ?: return@collect
+                if (ended.status != OrderStatus.CANCELLED) return@collect
+                CaptainNotificationManager.showActiveOrderCancelledNotification(
+                    context = appContext,
+                    orderKey = endedKey,
+                    storeName = ended.storeName,
+                    orderCode = ended.cleanOrderCode,
+                    reason = ended.cancellationReason
+                )
+                _eventFlow.emit(
+                    UiEvent.ShowToast(
+                        CaptainNotificationManager.buildActiveOrderCancelledMessage(
+                            ended.storeName, ended.cleanOrderCode, ended.cancellationReason
+                        )
+                    )
+                )
+            }
         }
         // The location service is not restarted by Android after the app is killed or the captain
         // logs in while already marked online, so GPS went stale until the switch was toggled.
