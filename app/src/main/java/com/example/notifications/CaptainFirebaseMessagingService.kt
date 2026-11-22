@@ -108,7 +108,10 @@ class CaptainFirebaseMessagingService : FirebaseMessagingService() {
                             customerPhone = data["customerPhone"].orEmpty(),
                             storeName = storeName,
                             storePhone = data["storePhone"].orEmpty(),
-                            storeImage = data["storeImage"].orEmpty(),
+                            storeImage = com.example.data.resolveMerchantImageReference(
+                                storeImage = data["storeImage"],
+                                storeImagePath = data["storeImagePath"]
+                            ),
                             pickupAddress = pickup.ifBlank { "مقر التاجر" },
                             deliveryAddress = delivery.ifBlank { "عنوان العميل" },
                             storeLocationUrl = storeLocationUrl,

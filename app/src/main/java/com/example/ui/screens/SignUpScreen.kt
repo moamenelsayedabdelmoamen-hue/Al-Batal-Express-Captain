@@ -260,49 +260,53 @@ fun SignUpScreen(
 
                     Spacer(modifier = Modifier.height(14.dp))
 
-                    Box(
-                        modifier = Modifier
-                            .size(105.dp)
-                            .clip(CircleShape)
-                            .background(
-                                brush = Brush.radialGradient(
-                                    colors = listOf(ExpressRed, Color(0xFF380800))
+                    // Outer box is not clipped so the camera badge can sit on the circle's edge
+                    // without being cut off by the circular clip of the photo.
+                    Box(modifier = Modifier.size(105.dp)) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .clip(CircleShape)
+                                .background(
+                                    brush = Brush.radialGradient(
+                                        colors = listOf(ExpressRed, Color(0xFF380800))
+                                    )
                                 )
-                            )
-                            .border(3.dp, if (avatarUri.isNotBlank()) HeroYellow else ExpressRed, CircleShape)
-                            .clickable(enabled = !isLoading) {
-                                profileSourceLauncher.openSourceDialog()
-                            }
-                            .testTag("signup_profile_photo_box"),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        if (avatarUri.isNotBlank()) {
-                            AsyncImage(
-                                model = avatarUri,
-                                contentDescription = "معاينة الصورة الشخصية للكابتن",
-                                contentScale = ContentScale.Crop,
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .clip(CircleShape)
-                            )
-                        } else {
-                            Column(
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.Center
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Person,
-                                    contentDescription = null,
-                                    tint = Color.White,
-                                    modifier = Modifier.size(48.dp)
+                                .border(3.dp, if (avatarUri.isNotBlank()) HeroYellow else ExpressRed, CircleShape)
+                                .clickable(enabled = !isLoading) {
+                                    profileSourceLauncher.openSourceDialog()
+                                }
+                                .testTag("signup_profile_photo_box"),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            if (avatarUri.isNotBlank()) {
+                                AsyncImage(
+                                    model = avatarUri,
+                                    contentDescription = "معاينة الصورة الشخصية للكابتن",
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .clip(CircleShape)
                                 )
-                                Spacer(modifier = Modifier.height(2.dp))
-                                Icon(
-                                    imageVector = Icons.Default.AddAPhoto,
-                                    contentDescription = null,
-                                    tint = HeroYellow,
-                                    modifier = Modifier.size(18.dp)
-                                )
+                            } else {
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.Center
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Person,
+                                        contentDescription = null,
+                                        tint = Color.White,
+                                        modifier = Modifier.size(48.dp)
+                                    )
+                                    Spacer(modifier = Modifier.height(2.dp))
+                                    Icon(
+                                        imageVector = Icons.Default.AddAPhoto,
+                                        contentDescription = null,
+                                        tint = HeroYellow,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
                             }
                         }
 
@@ -312,7 +316,10 @@ fun SignUpScreen(
                                 .size(30.dp)
                                 .clip(CircleShape)
                                 .background(HeroYellow)
-                                .border(2.dp, DarkSurface, CircleShape),
+                                .border(2.dp, DarkSurface, CircleShape)
+                                .clickable(enabled = !isLoading) {
+                                    profileSourceLauncher.openSourceDialog()
+                                },
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(

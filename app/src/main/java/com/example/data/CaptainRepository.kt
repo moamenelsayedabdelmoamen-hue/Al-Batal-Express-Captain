@@ -178,7 +178,14 @@ class CaptainRepository(
             override suspend fun reloadCurrentUser(): AuthUserSnapshot? {
                 val u = firebaseAuth.currentUser ?: return null
                 u.reload().await()
-                return firebaseAuth.currentUser?.toSnapshot() ?: u.toSnapshot()
+                val refreshed = firebaseAuth.currentUser ?: u
+                // reload() updates isEmailVerified locally, but Firestore keeps using the cached ID
+                // token (email_verified=false) for up to an hour. Force a new token once verified so
+                // the rules accept the follow-up emailVerified / isOnline write.
+                if (refreshed.isEmailVerified) {
+                    runCatching { refreshed.getIdToken(true).await() }
+                }
+                return refreshed.toSnapshot()
             }
 
             override suspend fun updateDisplayName(displayName: String) {
@@ -367,89 +374,19 @@ class CaptainRepository(
             }
         }
     }
-    private val merchantLocationCache = java.util.concurrent.ConcurrentHashMap<String, Triple<String, Double?, Double?>>()
 
-    private suspend fun lookupMerchantLocationFromFirestore(
+    /**
+     * Merchant account documents (merchants/, users/, and the retired restaurants/) are readable
+     * only by the merchant and admins, so a captain cannot look them up: every attempt was a
+     * PERMISSION_DENIED round trip. The server copies the store location onto the order itself
+     * (storeLocationUrl / pickup coordinates), which is what callers fall back to.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    private fun lookupMerchantLocationFromFirestore(
         merchantId: String,
         storeName: String,
         forceRefresh: Boolean
-    ): Triple<String, Double?, Double?> {
-        val cleanMerchantId = merchantId.trim()
-        val cleanStoreName = storeName.trim()
-        val cacheKey = if (cleanMerchantId.isNotBlank()) "id:$cleanMerchantId" else "name:$cleanStoreName"
-        if (!forceRefresh && cacheKey.isNotBlank()) {
-            merchantLocationCache[cacheKey]?.let { return it }
-        }
-
-        suspend fun extractFromDoc(doc: DocumentSnapshot?): Triple<String, Double?, Double?>? {
-            if (doc == null || !doc.exists()) return null
-            val url = extractMerchantLocationUrlFromFieldsMap(doc.data)
-            var lat: Double? = null
-            var lng: Double? = null
-            val geo = try {
-                doc.getGeoPoint("location") ?: doc.getGeoPoint("restaurant_location") ?: doc.getGeoPoint("pickup_location")
-            } catch (_: Exception) { null }
-            if (geo != null) {
-                lat = geo.latitude
-                lng = geo.longitude
-            } else {
-                lat = (doc.get("latitude") as? Number)?.toDouble()
-                    ?: (doc.get("lat") as? Number)?.toDouble()
-                    ?: (doc.get("restaurantLatitude") as? Number)?.toDouble()
-                lng = (doc.get("longitude") as? Number)?.toDouble()
-                    ?: (doc.get("lng") as? Number)?.toDouble()
-                    ?: (doc.get("restaurantLongitude") as? Number)?.toDouble()
-            }
-            return if (url.isNotBlank() || (lat != null && lng != null)) {
-                Triple(url, lat, lng)
-            } else {
-                null
-            }
-        }
-
-        var resolved: Triple<String, Double?, Double?>? = null
-        if (cleanMerchantId.isNotBlank()) {
-            for (collectionName in listOf("restaurants", "merchants", "users")) {
-                try {
-                    val doc = firestore.collection(collectionName).document(cleanMerchantId).get().await()
-                    val candidate = extractFromDoc(doc)
-                    if (candidate != null && candidate.first.isNotBlank()) {
-                        resolved = candidate
-                        break
-                    } else if (resolved == null && candidate != null) {
-                        resolved = candidate
-                    }
-                } catch (e: Exception) {
-                    Log.d("CaptainRepository", "[MerchantLocation] $collectionName/$cleanMerchantId lookup notice: ${e.message}")
-                }
-            }
-        }
-
-        if ((resolved == null || resolved.first.isBlank()) &&
-            cleanStoreName.isNotBlank() &&
-            cleanStoreName !in listOf("مطعم الشريك", "مطعم مسجل", "التاجر")
-        ) {
-            try {
-                val querySnap = firestore.collection("restaurants")
-                    .whereEqualTo("name", cleanStoreName)
-                    .limit(1)
-                    .get()
-                    .await()
-                val candidate = extractFromDoc(querySnap.documents.firstOrNull())
-                if (candidate != null && (candidate.first.isNotBlank() || resolved == null)) {
-                    resolved = candidate
-                }
-            } catch (e: Exception) {
-                Log.d("CaptainRepository", "[MerchantLocation] restaurants query by name notice: ${e.message}")
-            }
-        }
-
-        val finalTriple = resolved ?: Triple("", null, null)
-        if (cacheKey.isNotBlank() && finalTriple.first.isNotBlank()) {
-            merchantLocationCache[cacheKey] = finalTriple
-        }
-        return finalTriple
-    }
+    ): Triple<String, Double?, Double?> = Triple("", null, null)
 
     suspend fun resolveMerchantLocationForOrder(
         order: OrderEntity,
@@ -581,8 +518,10 @@ class CaptainRepository(
     }
 
     suspend fun syncFcmToken() {
-        val uid = authBackend.currentUser()?.uid?.takeIf { it.isNotBlank() }
-            ?: cloudMetadataPort.currentAuthUid()?.takeIf { it.isNotBlank() }
+        // Best-effort: never throw if Firebase is not initialized (no google-services.json,
+        // or a live approval update arriving before startup finished).
+        val uid = runCatching { authBackend.currentUser()?.uid }.getOrNull()?.takeIf { it.isNotBlank() }
+            ?: runCatching { cloudMetadataPort.currentAuthUid() }.getOrNull()?.takeIf { it.isNotBlank() }
             ?: return
         val token = runCatching { FirebaseMessaging.getInstance().token.await() }.getOrNull()
             ?: context?.let { CaptainNotificationManager.getSavedFcmToken(it) }
@@ -627,7 +566,8 @@ class CaptainRepository(
 
     fun startRealtimeOrdersListener() {
         stopRealtimeOrdersListener()
-        val currentUser = firebaseAuth.currentUser
+        // Same guard as startRealtimeShiftListener: FirebaseAuth throws if Firebase is not initialized.
+        val currentUser = runCatching { firebaseAuth.currentUser }.getOrNull()
         if (currentUser == null) {
             Log.d("CaptainRepository", "[FirestoreOrdersListener] Waiting for captain authentication before starting orders listener")
             return
@@ -811,7 +751,7 @@ class CaptainRepository(
             // 1. Available pending orders scoped to this captain (matches firestore.rules isAvailablePendingOrder)
             ordersListenerRegistrations += firestore.collection("orders")
                 .whereEqualTo("status", "pending")
-                .whereArrayContains("eligibleCaptainIds", authUid)
+                .whereEqualTo("offeredCaptainId", authUid)
                 .addSnapshotListener { snapshot, error ->
                     if (error != null) {
                         Log.w("CaptainRepository", "[FirestoreOrdersListener] pending query notice: ${error.message}")
@@ -845,7 +785,7 @@ class CaptainRepository(
     }
 
     /**
-     * Dedicated query for orders filtered strictly by status == 'pending'.
+     * Dedicated query for pending offers addressed specifically to this captain UID.
      * Logs query execution and all matched documents for verification.
      */
     suspend fun queryPendingOrdersFromFirestore(): Result<List<OrderEntity>> {
@@ -862,15 +802,15 @@ class CaptainRepository(
             if (myUid.isBlank()) {
                 return Result.success(emptyList())
             }
-            Log.i("CaptainRepository", "[FirestoreQuery] Executing scoped query on 'orders' where status == 'pending' and eligibleCaptainIds array-contains captain...")
+            Log.i("CaptainRepository", "[FirestoreQuery] Executing scoped query on 'orders' where status == 'pending' and offeredCaptainId equals captain...")
             val querySnapshot = firestore.collection("orders")
                 .whereEqualTo("status", "pending")
-                .whereArrayContains("eligibleCaptainIds", myUid)
+                .whereEqualTo("offeredCaptainId", myUid)
                 .get()
                 .await()
 
             val docs = querySnapshot.documents
-            Log.i("CaptainRepository", "[FirestoreQuery] Query 'status == pending' returned ${docs.size} documents (source=${if (querySnapshot.metadata.isFromCache) "cache" else "server"})")
+            Log.i("CaptainRepository", "[FirestoreQuery] Query 'status == pending AND offeredCaptainId == current captain' returned ${docs.size} documents (source=${if (querySnapshot.metadata.isFromCache) "cache" else "server"})")
 
             val pendingList = mutableListOf<OrderEntity>()
             for (doc in docs) {
@@ -897,7 +837,7 @@ class CaptainRepository(
     }
 
     /**
-     * One-time sync of orders from Firestore, executing and logging queries for status == 'pending'
+     * One-time sync of orders from Firestore, executing and logging private offeredCaptainId queries
      * as well as syncing captain's active orders into Room database.
      */
     suspend fun syncOrdersFromFirestore(): Result<Int> {
@@ -933,7 +873,7 @@ class CaptainRepository(
                 try {
                     val pendingSnapshot = firestore.collection("orders")
                         .whereEqualTo("status", "pending")
-                        .whereArrayContains("eligibleCaptainIds", myUid)
+                        .whereEqualTo("offeredCaptainId", myUid)
                         .get()
                         .await()
                     for (doc in pendingSnapshot.documents) {
@@ -2500,6 +2440,17 @@ class CaptainRepository(
 
         suspend fun rollbackOrMarkResumable(uid: String) {
             if (!createdAuthUser && uid != pendingIncompleteRegistrationUid) return
+            // Remove this attempt's uploads first: Storage rules allow it only while the Auth user
+            // still exists and has no captains doc. Forget only the files really deleted, so a resumed
+            // attempt re-uploads those and still reuses any upload that could not be removed.
+            val uploadKeyPrefix = "$uid|"
+            val uploadedForUid = pendingRegistrationUploadedPaths.filterKeys { it.startsWith(uploadKeyPrefix) }
+            if (uploadedForUid.isNotEmpty()) {
+                val deleted = runCatching {
+                    storageRepository.deleteRegistrationUploads(uid, uploadedForUid.values.toList())
+                }.getOrDefault(emptySet())
+                uploadedForUid.filterValues { it in deleted }.keys.forEach { pendingRegistrationUploadedPaths.remove(it) }
+            }
             val deleteResult = runCatching { authBackend.deleteCurrentUser() }
             if (deleteResult.isSuccess && authBackend.currentUser()?.uid != uid) {
                 clearPendingIncompleteRegistration()
@@ -2771,6 +2722,7 @@ class CaptainRepository(
 
     private var lastUploadedLocation: Location? = null
     private var lastLocationUploadTimestamp: Long = 0L
+    private var lastUploadedPresence: String? = null
 
     suspend fun updateCaptainGpsLocation(location: Location) {
         if (_accountApprovalState.value != null && !isCurrentSessionApproved) return
@@ -2784,13 +2736,16 @@ class CaptainRepository(
         val distance = if (lastLoc != null) location.distanceTo(lastLoc) else Float.MAX_VALUE
         val timeDiff = now - lastLocationUploadTimestamp
 
-        // Smart Throttling: send only if moved >= MIN_DISPLACEMENT_METERS or heartbeat interval elapsed
-        if (lastLoc != null && distance < GpsConfig.MIN_DISPLACEMENT_METERS && timeDiff < GpsConfig.FIRESTORE_HEARTBEAT_INTERVAL_MS) {
-            return
-        }
-
         val activeOrder = activeOrderFlow.firstOrNull()
         val presenceValue = if (activeOrder != null) "on_trip" else "available"
+
+        // Smart Throttling: send only if moved >= MIN_DISPLACEMENT_METERS, the heartbeat interval elapsed,
+        // or the trip state changed (a stale "on_trip" keeps the captain out of dispatch).
+        if (lastLoc != null && distance < GpsConfig.MIN_DISPLACEMENT_METERS &&
+            timeDiff < GpsConfig.FIRESTORE_HEARTBEAT_INTERVAL_MS && presenceValue == lastUploadedPresence
+        ) {
+            return
+        }
 
         val locationData = hashMapOf<String, Any>(
             "location" to GeoPoint(location.latitude, location.longitude),
@@ -2811,6 +2766,7 @@ class CaptainRepository(
             firestore.collection("captains").document(uid).update(locationData).await()
             lastUploadedLocation = location
             lastLocationUploadTimestamp = now
+            lastUploadedPresence = presenceValue
             Log.d("CaptainRepository", "Uploaded GPS location to Firestore for captain $uid: ${location.latitude}, ${location.longitude}")
         } catch (e: Exception) {
             Log.e("CaptainRepository", "Error uploading GPS location to Firestore", e)
@@ -2842,6 +2798,11 @@ class CaptainRepository(
         } catch (e: Exception) {
             Log.w("CaptainRepository", "Notice updating offline status in Firestore: ${e.message}")
         }
+    }
+
+    /** Mirrors an admin-side status change (approval, suspension) into the local profile. */
+    suspend fun applyRemoteAccountStatus(status: String) {
+        captainDao.updateAccountStatus(status)
     }
 
     suspend fun setOnlineStatus(isOnline: Boolean) {
@@ -3751,9 +3712,16 @@ fun DocumentSnapshot.toOrderEntity(): OrderEntity? {
         default = "مطعم الشريك"
     )
     val storePhone = safeString("storePhone", "restaurantPhone", "restaurant_phone", "store_phone", "vendorPhone")
-    val storeImage = safeString(
-        "storeImage", "storePhotoUrl", "restaurantImage", "restaurant_image",
-        "restaurantPhoto", "store_image", "imageUrl", "image", "photoUrl"
+    val storeImage = resolveMerchantImageReference(
+        storeImage = safeString(
+            "storeImage", "merchantImageUrl", "merchantLogo", "profileImageUrl",
+            "logoUrl", "storeLogo", "storePhotoUrl", "restaurantImage",
+            "restaurant_image", "restaurantPhoto", "store_image", "imageUrl", "image", "photoUrl"
+        ),
+        storeImagePath = safeString(
+            "storeImagePath", "store_image_path", "merchantStoragePath", "merchant_storage_path",
+            "logoStoragePath", "logo_storage_path", "merchantLogoPath", "merchant_logo_path"
+        )
     )
     val pickup = safeString(
         "pickupAddress", "pickup_address", "restaurant_address", "restaurantAddress",

@@ -156,8 +156,8 @@ fun AvailableTripCard(
                     contentAlignment = Alignment.Center
                 ) {
                     if (order.storeImage.isNotBlank()) {
-                        AsyncImage(
-                            model = order.storeImage,
+                        StorageAsyncImage(
+                            pathOrUrl = order.storeImage,
                             contentDescription = order.storeName,
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize()

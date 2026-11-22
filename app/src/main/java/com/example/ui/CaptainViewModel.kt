@@ -44,6 +44,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -90,6 +91,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         } else null
     }
     private var shiftDocListener: ListenerRegistration? = null
+    private var accountStatusListener: ListenerRegistration? = null
     private var authStateListener: FirebaseAuth.AuthStateListener? = null
 
     val captainState: StateFlow<CaptainEntity?> = repository.captainFlow
@@ -591,8 +593,97 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                     }
                 }
         }
+        // Tell the captain when the trip they were on is cancelled (merchant or admin); before, the
+        // trip just vanished from the screen with no explanation.
+        viewModelScope.launch {
+            var previousActiveKey: String? = null
+            activeOrder.collect { current ->
+                val currentKey = current?.firestoreDocId?.ifBlank { current.id.toString() }
+                val endedKey = previousActiveKey
+                previousActiveKey = currentKey
+                if (endedKey == null || endedKey == currentKey) return@collect
+                val ended = repository.allOrdersFlow.first().find {
+                    it.firestoreDocId == endedKey || it.id.toString() == endedKey
+                } ?: return@collect
+                if (ended.status != OrderStatus.CANCELLED) return@collect
+                CaptainNotificationManager.showActiveOrderCancelledNotification(
+                    context = appContext,
+                    orderKey = endedKey,
+                    storeName = ended.storeName,
+                    orderCode = ended.cleanOrderCode,
+                    reason = ended.cancellationReason
+                )
+                _eventFlow.emit(
+                    UiEvent.ShowToast(
+                        CaptainNotificationManager.buildActiveOrderCancelledMessage(
+                            ended.storeName, ended.cleanOrderCode, ended.cancellationReason
+                        )
+                    )
+                )
+            }
+        }
+        // The location service is not restarted by Android after the app is killed or the captain
+        // logs in while already marked online, so GPS went stale until the switch was toggled.
+        // Wait for the startup session check: the cached profile can say "logged in" for a session
+        // that check then rejects, and tracking must stop again when that happens.
+        viewModelScope.launch {
+            combine(captainState, _hasCompletedIntroSplash) { captain, sessionChecked ->
+                if (!sessionChecked) null else captain != null && captain.isLoggedIn && captain.isOnline
+            }
+                .distinctUntilChanged()
+                .collect { shouldTrack ->
+                    when (shouldTrack) {
+                        true -> resumeLocationTrackingIfNeeded()
+                        false -> if (CaptainLocationTracker.isTracking.value) {
+                            CaptainLocationTracker.stopService(getApplication())
+                        }
+                        null -> Unit
+                    }
+                }
+        }
         // Set up real-time SnapshotListener on Firestore for captain shifts
         setupRealtimeShiftListener()
+    }
+
+    private fun resumeLocationTrackingIfNeeded() {
+        val app = getApplication<Application>()
+        if (CaptainLocationTracker.isTracking.value) return
+        if (auth?.currentUser?.isEmailVerified != true) return
+        if (!CaptainLocationTracker.hasLocationPermission(app)) {
+            viewModelScope.launch { _eventFlow.emit(UiEvent.RequestLocationPermission) }
+            return
+        }
+        if (!CaptainLocationTracker.isGpsProviderEnabled(app)) {
+            viewModelScope.launch { _eventFlow.emit(UiEvent.RequestGpsEnable) }
+            return
+        }
+        runCatching { CaptainLocationTracker.startService(app) }
+            .onFailure { Log.w("CaptainViewModel", "Could not resume location service: ${it.message}") }
+    }
+
+    /**
+     * Applies an admin-side status change (approval, suspension) while the app is open.
+     * Without this the app kept the status it read at login until it was restarted.
+     */
+    private suspend fun onRemoteAccountStatus(remoteStatus: String) {
+        val local = captainState.value ?: repository.getCaptain() ?: return
+        val previous = local.status.trim().lowercase()
+        if (previous == remoteStatus) return
+        repository.applyRemoteAccountStatus(remoteStatus)
+        val app = getApplication<Application>()
+        when {
+            remoteStatus in BLOCKED_ACCOUNT_STATUSES -> {
+                CaptainNotificationManager.stopIncomingOrderBell(app)
+                if (local.isOnline) {
+                    CaptainLocationTracker.stopService(app)
+                    repository.setOnlineStatus(false)
+                }
+                _eventFlow.emit(UiEvent.ShowToast("تم إيقاف حسابك من الإدارة، ولن تصلك طلبات جديدة. تواصل مع الإدارة."))
+            }
+            remoteStatus !in INACTIVE_ACCOUNT_STATUSES && previous in INACTIVE_ACCOUNT_STATUSES -> {
+                _eventFlow.emit(UiEvent.ShowToast("تم تفعيل حسابك من الإدارة ✅ يمكنك الآن استقبال الطلبات."))
+            }
+        }
     }
 
     /**
@@ -1754,11 +1845,25 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                     )
                 }
             }
+
+        accountStatusListener = dbFirestore.collection("captains").document(uid)
+            .addSnapshotListener { snapshot, error ->
+                if (error != null) {
+                    Log.w("CaptainViewModel", "[CaptainDocListener] captains/$uid error: ${error.message}")
+                    return@addSnapshotListener
+                }
+                val remoteStatus = snapshot?.takeIf { it.exists() }
+                    ?.getString("status")?.trim()?.lowercase()
+                    ?.takeIf { it.isNotBlank() } ?: return@addSnapshotListener
+                viewModelScope.launch { onRemoteAccountStatus(remoteStatus) }
+            }
     }
 
     fun detachShiftSnapshotListeners() {
         shiftDocListener?.remove()
         shiftDocListener = null
+        accountStatusListener?.remove()
+        accountStatusListener = null
         _liveShifts.value = emptyList()
         _hasLiveShiftSnapshot.value = false
         _shiftStatus.value = ShiftStatus.NoSchedule()
@@ -1774,6 +1879,9 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
     }
 
     companion object {
+        private val BLOCKED_ACCOUNT_STATUSES = setOf("banned", "suspended", "disabled", "blocked")
+        private val INACTIVE_ACCOUNT_STATUSES = BLOCKED_ACCOUNT_STATUSES + setOf("pending", "inactive")
+
         fun calculateDailyWorkHours(
             shifts: List<ShiftEntity>,
             nowCal: java.util.Calendar = ShiftManager.getCurrentCairoCalendar()

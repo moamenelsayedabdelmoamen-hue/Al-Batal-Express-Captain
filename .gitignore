@@ -18,3 +18,11 @@ local.properties
 debug.keystore
 *-debug.log
 node_modules
+
+# Secrets and generated files that must never be committed
+google-services.json
+*.keystore
+*.jks
+*.keystore.base64
+.firebase/
+.project-backup*/

@@ -490,20 +490,33 @@ class SecurityAuditRuleTest {
         storageRepo.clearSessionMemoryCache()
         assertFalse("Logout clearSessionMemoryCache MUST wipe private ID/receipt cache from disk", cacheRoot.exists())
 
-        // Verify google-services.json targets el-batal-express-956ae
+        // Verify google-services.json targets el-batal-express-956ae. The file is not committed;
+        // CI writes it from the GOOGLE_SERVICES_JSON secret, so check it only when present.
         val googleServicesFile = listOf(
             File("google-services.json"),
             File("app/google-services.json"),
             File("../app/google-services.json")
         ).firstOrNull { it.exists() }
-        assertNotNull("google-services.json must exist", googleServicesFile)
-        val gsJson = JSONObject(googleServicesFile!!.readText())
-        val projectInfo = gsJson.getJSONObject("project_info")
-        assertEquals("el-batal-express-956ae", projectInfo.getString("project_id"))
-        assertEquals("el-batal-express-956ae.firebasestorage.app", projectInfo.getString("storage_bucket"))
+        if (googleServicesFile != null) {
+            val gsJson = JSONObject(googleServicesFile.readText())
+            val projectInfo = gsJson.getJSONObject("project_info")
+            assertEquals("el-batal-express-956ae", projectInfo.getString("project_id"))
+            assertEquals("el-batal-express-956ae.firebasestorage.app", projectInfo.getString("storage_bucket"))
+        }
 
         // Verify zero public downloadUrl calls in production Kotlin source files
         val mainSrcDir = listOf(File("src/main/java"), File("app/src/main/java")).first { it.exists() }
+        val captainRepositoryFile = File(mainSrcDir, "com/example/data/CaptainRepository.kt")
+        assertTrue("CaptainRepository must exist in the Android source set", captainRepositoryFile.isFile)
+        val captainRepositorySource = captainRepositoryFile.readText()
+        assertTrue(
+            "Captain orders must be scoped to the server-issued offeredCaptainId",
+            captainRepositorySource.contains(".whereEqualTo(\"offeredCaptainId\"")
+        )
+        assertFalse(
+            "Captain orders must never be queried through the full eligibleCaptainIds list",
+            captainRepositorySource.contains(".whereArrayContains(\"eligibleCaptainIds\"")
+        )
         val filesCallingDownloadUrl = mainSrcDir.walkTopDown()
             .filter { it.isFile && it.extension == "kt" }
             .filter { file ->

@@ -43,8 +43,27 @@ jobs:
             echo "::warning::DEBUG_KEYSTORE_BASE64 secret is not set; generating ephemeral CI debug keystore (installing over a differently signed APK via USB requires uninstalling the old build first)."
             keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -dname "CN=Android Debug,O=Android,C=US" -keyalg RSA -keysize 2048 -validity 10000
           fi
+      - name: Write google-services.json from secret
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -n "$GOOGLE_SERVICES_JSON" ]; then
+            printf '%s' "$GOOGLE_SERVICES_JSON" > app/google-services.json
+            echo "Wrote app/google-services.json from the GOOGLE_SERVICES_JSON secret."
+          else
+            echo "::warning::GOOGLE_SERVICES_JSON secret is not set; the APK will not connect to Firebase and the project-config test is skipped."
+          fi
       - name: Run Captain unit tests
         run: gradle :app:testDebugUnitTest
+      - name: Upload unit test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.repository.name }}-unit-test-reports
+          path: |
+            app/build/reports/tests/testDebugUnitTest
+            app/build/test-results/testDebugUnitTest
+          if-no-files-found: ignore
       - name: Build Captain debug APK
         run: gradle :app:assembleDebug
       - uses: actions/upload-artifact@v4

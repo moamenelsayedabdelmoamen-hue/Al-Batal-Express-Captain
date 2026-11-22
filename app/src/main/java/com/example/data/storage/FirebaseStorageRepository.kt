@@ -5,6 +5,7 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.util.Log
 import android.webkit.MimeTypeMap
 import androidx.core.content.FileProvider
 import com.example.data.OrderStatus
@@ -76,6 +77,12 @@ interface StorageGateway {
         maxDownloadBytes: Long,
         requesterUid: String
     ): ByteArray
+
+    /** Deletes an object; the default is a no-op so test gateways need not implement it. */
+    // Gateways that cannot delete report failure, so callers never assume a file is gone.
+    suspend fun delete(storagePath: String, requesterUid: String) {
+        throw UnsupportedOperationException("delete is not supported by this StorageGateway")
+    }
 }
 
 fun interface NetworkConnectivityChecker {
@@ -133,6 +140,10 @@ class OfficialFirebaseStorageGateway(
         val ref = firebaseStorageProvider().reference.child(storagePath)
         return ref.getBytes(maxDownloadBytes).await()
     }
+
+    override suspend fun delete(storagePath: String, requesterUid: String) {
+        firebaseStorageProvider().reference.child(storagePath).delete().await()
+    }
 }
 
 /**
@@ -169,6 +180,22 @@ class FirebaseStorageRepository(
     private val pathVersionCounter = ConcurrentHashMap<String, Long>()
 
     fun getPathRevision(storagePath: String): Long = pathVersionCounter[normalizeStoragePath(storagePath)] ?: 0L
+
+    /**
+     * Best-effort removal of images uploaded during a sign-up that then failed, so they are not
+     * left orphaned. Storage rules allow it only while captains/{uid} does not exist.
+     */
+    suspend fun deleteRegistrationUploads(captainId: String, storagePaths: List<String>): Set<String> {
+        val uid = captainId.trim()
+        val deleted = mutableSetOf<String>()
+        storagePaths.filter { normalizeStoragePath(it).startsWith("captains/$uid/") }
+            .forEach { path ->
+                runCatching { gateway.delete(normalizeStoragePath(path), uid) }
+                    .onSuccess { deleted += path }
+                    .onFailure { Log.w("FirebaseStorageRepo", "Could not remove orphaned upload $path: ${it.message}") }
+            }
+        return deleted
+    }
 
     /**
      * Creates a secure temporary Uri via FileProvider for capturing a photo with the device camera.
