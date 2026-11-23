@@ -80,11 +80,12 @@ class ShiftAlarmReceiver : BroadcastReceiver() {
                         // If the captain explicitly pressed Ready before the shift, promote to working
                         // and start GPS/order listeners even when the app process was not open.
                         val activeNow = ShiftManager.calculateShiftStatus(shifts) is ShiftStatus.Active
-                        if (captain.isOnline && activeNow && repository.hasConfirmedShiftReadiness()) {
+                        if (captain.isOnline && activeNow && repository.hasConfirmedShiftReadiness() &&
+                            CaptainLocationTracker.hasLocationPermission(appContext) &&
+                            CaptainLocationTracker.isGpsProviderEnabled(appContext)
+                        ) {
                             repository.setOnlineStatus(true)
-                            if (CaptainLocationTracker.hasLocationPermission(appContext) &&
-                                CaptainLocationTracker.isGpsProviderEnabled(appContext)
-                            ) {
+                            if (repository.isEligibleForLocationTracking()) {
                                 CaptainLocationTracker.startService(appContext)
                             }
                         }
