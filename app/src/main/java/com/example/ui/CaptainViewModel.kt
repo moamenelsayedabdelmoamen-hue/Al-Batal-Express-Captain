@@ -854,9 +854,30 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         val status = _shiftStatus.value
 
         if (currentlyOnline) {
-            CaptainNotificationManager.stopIncomingOrderBell(app)
-            CaptainLocationTracker.stopService(app)
             viewModelScope.launch {
+                val readyButNotWorking = status is ShiftStatus.Active &&
+                    repository.hasConfirmedShiftReadiness() &&
+                    !repository.isEligibleForLocationTracking()
+                if (readyButNotWorking) {
+                    if (!CaptainLocationTracker.hasLocationPermission(app)) {
+                        _eventFlow.emit(UiEvent.RequestLocationPermission)
+                        return@launch
+                    }
+                    if (!CaptainLocationTracker.isGpsProviderEnabled(app)) {
+                        _eventFlow.emit(UiEvent.RequestGpsEnable)
+                        return@launch
+                    }
+                    repository.setOnlineStatus(true)
+                    if (repository.isEligibleForLocationTracking()) {
+                        CaptainLocationTracker.startService(app)
+                        repository.syncOrdersDetailedFromFirestore()
+                        _eventFlow.emit(UiEvent.ShowToast("تم تفعيل العمل وGPS لهذا الشفت."))
+                    }
+                    return@launch
+                }
+
+                CaptainNotificationManager.stopIncomingOrderBell(app)
+                CaptainLocationTracker.stopService(app)
                 if (status is ShiftStatus.UpcomingSoon) {
                     repository.setCaptainReadyStatus(false)
                     _eventFlow.emit(UiEvent.ShowToast("تم إلغاء تأكيد الجاهزية لهذا الشفت."))
