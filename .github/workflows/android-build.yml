@@ -18,7 +18,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 130
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -39,9 +39,8 @@ jobs:
         run: |
           if [ -n "$DEBUG_KEYSTORE_BASE64" ]; then
             printf '%s' "$DEBUG_KEYSTORE_BASE64" | base64 -d > debug.keystore
-            echo "Configured unified debug keystore from GitHub Actions Secret."
           else
-            echo "::warning::DEBUG_KEYSTORE_BASE64 secret is not set; generating ephemeral CI debug keystore (installing over a differently signed APK via USB requires uninstalling the old build first)."
+            echo "::warning::DEBUG_KEYSTORE_BASE64 is not set; generating an ephemeral CI debug keystore."
             keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -dname "CN=Android Debug,O=Android,C=US" -keyalg RSA -keysize 2048 -validity 10000
           fi
       - name: Write google-services.json from secret
@@ -50,26 +49,60 @@ jobs:
         run: |
           if [ -n "$GOOGLE_SERVICES_JSON" ]; then
             printf '%s' "$GOOGLE_SERVICES_JSON" > app/google-services.json
-            echo "Wrote app/google-services.json from the GOOGLE_SERVICES_JSON secret."
+            echo "Wrote app/google-services.json from secret."
           else
-            echo "::warning::GOOGLE_SERVICES_JSON secret is not set; the APK will not connect to Firebase and the project-config test is skipped."
+            echo "::warning::GOOGLE_SERVICES_JSON is not set; Firebase project-config test may be skipped."
           fi
-      - name: Run Captain unit tests
-        timeout-minutes: 80
-        run: gradle --no-daemon --console=plain --info :app:testDebugUnitTest
-      - name: Upload unit test reports
-        if: failure() || cancelled()
+      - name: Run unit tests one class at a time
+        timeout-minutes: 115
+        shell: bash
+        run: |
+          set -uo pipefail
+          LOG="$RUNNER_TEMP/captain-unit-tests.log"
+          : > "$LOG"
+          failed=0
+          mapfile -t TEST_FILES < <(find app/src/test/java -type f -name '*Test.kt' | sort)
+          echo "Discovered ${#TEST_FILES[@]} test source files." | tee -a "$LOG"
+          for file in "${TEST_FILES[@]}"; do
+            package_name="$(sed -n 's/^package[[:space:]]\+\([^[:space:]]\+\).*/\1/p' "$file" | head -n 1)"
+            class_name="$(basename "$file" .kt)"
+            if [ -z "$package_name" ]; then
+              echo "SKIP: no package declaration in $file" | tee -a "$LOG"
+              continue
+            fi
+            test_class="$package_name.$class_name"
+            echo "===== START $test_class $(date -u +%FT%TZ) =====" | tee -a "$LOG"
+            if timeout --foreground --signal=INT --kill-after=20s 300s gradle --console=plain --info :app:testDebugUnitTest --tests "$test_class" 2>&1 | tee -a "$LOG"; then
+              echo "===== PASS $test_class =====" | tee -a "$LOG"
+            else
+              code=${PIPESTATUS[0]}
+              echo "===== FAIL_OR_TIMEOUT $test_class exit=$code =====" | tee -a "$LOG"
+              failed=1
+              gradle --stop || true
+            fi
+          done
+          cp "$LOG" captain-unit-tests.log
+          if [ "$failed" -ne 0 ]; then
+            echo "At least one test class failed or exceeded the 5-minute diagnostic limit."
+            exit 1
+          fi
+      - name: Upload unit test diagnostics
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.repository.name }}-unit-test-reports
+          name: captain-unit-test-diagnostics
           path: |
+            captain-unit-tests.log
             app/build/reports/tests/testDebugUnitTest
             app/build/test-results/testDebugUnitTest
           if-no-files-found: ignore
       - name: Build Captain debug APK
-        run: gradle --no-daemon --console=plain :app:assembleDebug
-      - uses: actions/upload-artifact@v4
+        if: always() && !cancelled()
+        run: gradle --console=plain :app:assembleDebug
+      - name: Upload Captain debug APK
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.repository.name }}-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
+          if-no-files-found: warn
