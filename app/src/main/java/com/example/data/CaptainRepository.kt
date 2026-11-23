@@ -2753,9 +2753,9 @@ class CaptainRepository(
 
     suspend fun updateCaptainGpsLocation(location: Location): Boolean {
         if (!isEligibleForLocationTracking()) return false
-        val user = firebaseAuth.currentUser ?: return
+        val user = firebaseAuth.currentUser ?: return false
         val uid = user.uid
-        if (uid.isBlank()) return
+        if (uid.isBlank()) return false
         val now = System.currentTimeMillis()
         val timeDiff = now - lastLocationUploadTimestamp
         // Fixed five-minute Firestore cadence. Movement and trip-state changes never bypass it.
