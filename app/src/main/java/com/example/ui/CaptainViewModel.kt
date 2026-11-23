@@ -724,16 +724,17 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         if (CaptainLocationTracker.isTracking.value) return
         if (auth?.currentUser?.isEmailVerified != true) return
         viewModelScope.launch {
-            if (!repository.isEligibleForLocationTracking()) {
-                CaptainLocationTracker.stopService(app)
-                return@launch
-            }
+            // Do not ask the server to promote Ready to Working until GPS permission/provider exist.
             if (!CaptainLocationTracker.hasLocationPermission(app)) {
                 _eventFlow.emit(UiEvent.RequestLocationPermission)
                 return@launch
             }
             if (!CaptainLocationTracker.isGpsProviderEnabled(app)) {
                 _eventFlow.emit(UiEvent.RequestGpsEnable)
+                return@launch
+            }
+            if (!repository.isEligibleForLocationTracking()) {
+                CaptainLocationTracker.stopService(app)
                 return@launch
             }
             runCatching { CaptainLocationTracker.startService(app) }
