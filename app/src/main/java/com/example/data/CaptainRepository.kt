@@ -2779,6 +2779,8 @@ class CaptainRepository(
 
         val offlineData = mapOf<String, Any>(
             "isOnline" to false,
+            "workStatus" to "off_shift",
+            "readyConfirmed" to false,
             "presenceStatus" to "offline",
             "availabilityStatus" to "offline",
             "updatedAt" to FieldValue.serverTimestamp()
