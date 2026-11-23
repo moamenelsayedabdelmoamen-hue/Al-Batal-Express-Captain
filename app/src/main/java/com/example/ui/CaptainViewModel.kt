@@ -477,7 +477,8 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                             endFormatted = latestShiftStatus.endFormatted,
                             dedupeKey = ShiftNotificationScheduler.buildTodayDedupeKey(latestShiftStatus.shift, isStart = true)
                         )
-                        val wasReady = captainState.value?.isOnline == true
+                        val wasReady = captainState.value?.isOnline == true &&
+                            repository.hasConfirmedShiftReadiness()
                         if (wasReady) {
                             repository.setOnlineStatus(true)
                             if (CaptainLocationTracker.hasLocationPermission(appContext) &&
@@ -509,6 +510,15 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                         _eventFlow.emit(
                             UiEvent.ShowToast("انتهى شفت العمل. تم إيقاف استقبال الطلبات وتتبع الموقع.")
                         )
+                    }
+                    if (prev == null && captainState.value?.isOnline == true &&
+                        latestShiftStatus !is ShiftStatus.Active &&
+                        !(latestShiftStatus is ShiftStatus.UpcomingSoon &&
+                            latestShiftStatus.millisUntilStart in 1L..(30L * 60_000L))
+                    ) {
+                        // Clear stale online state left by an older app version or a missed shift end.
+                        repository.setOnlineStatus(false)
+                        CaptainLocationTracker.stopService(appContext)
                     }
                     previousLoadedShiftStatus = latestShiftStatus
                 }
