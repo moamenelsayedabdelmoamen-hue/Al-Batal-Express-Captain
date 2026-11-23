@@ -16,6 +16,14 @@ interface OrderDao {
     @Query("SELECT * FROM orders WHERE firestoreDocId = :firestoreDocId LIMIT 1")
     suspend fun findByFirestoreDocId(firestoreDocId: String): OrderEntity?
 
+    @Query("""
+        SELECT * FROM orders
+        WHERE (:orderId > 0 AND id = :orderId)
+           OR (:orderKey != '' AND (firestoreDocId = :orderKey OR cleanOrderNumber = :orderKey))
+        LIMIT 1
+    """)
+    fun observeTrackedOrder(orderId: Long, orderKey: String): Flow<OrderEntity?>
+
     @Query("SELECT * FROM orders WHERE status IN ('ACCEPTED', 'AT_STORE', 'PICKED_UP', 'ORDER_DATA_ENTERED', 'AWAITING_MERCHANT_CONFIRMATION', 'MERCHANT_REJECTED', 'EN_ROUTE') ORDER BY createdAt DESC LIMIT 1")
     fun getActiveOrderFlow(): Flow<OrderEntity?>
 

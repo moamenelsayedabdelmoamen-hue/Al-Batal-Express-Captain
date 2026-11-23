@@ -37,6 +37,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
 
@@ -272,31 +274,39 @@ class IncomingOrderBellService : Service() {
         countdownJob?.cancel()
         countdownJob = serviceScope.launch {
             val db = runCatching { AppDatabase.getDatabase(applicationContext) }.getOrNull()
-            val notifManager = getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager
+            // Observe Room changes instead of querying the captain and order tables every second.
+            // The notification's native countdown chronometer updates itself without repeated notify() calls.
+            if (db != null) {
+                serviceScope.launch {
+                    try {
+                        combine(
+                            db.captainDao().getCaptainFlow(),
+                            db.orderDao().observeTrackedOrder(orderId, orderKey)
+                        ) { captain, trackedOrder -> captain to trackedOrder }
+                            .collect { (captain, trackedOrder) ->
+                                if (captain != null && (!captain.isLoggedIn || !captain.isOnline)) {
+                                    Log.i(TAG, "Captain offline or logged out; stopping incoming order bell")
+                                    stopBellAndFinish(removeNotification = true)
+                                    return@collect
+                                }
+                                if (trackedOrder != null && trackedOrder.status != OrderStatus.PENDING) {
+                                    Log.i(TAG, "Order status transitioned to ${trackedOrder.status}; stopping incoming order bell")
+                                    stopBellAndFinish(removeNotification = true)
+                                    return@collect
+                                }
+                            }
+                    } catch (_: CancellationException) {
+                        // Normal cancellation when the bell service stops.
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Room state observer notice: ${e.message}")
+                    }
+                }
+            }
 
             try {
                 while (true) {
-                    val nowMs = System.currentTimeMillis()
-                    val remainingMs = expiresAtMs - nowMs
+                    val remainingMs = expiresAtMs - System.currentTimeMillis()
                     val remainingSecs = ((remainingMs + 999L) / 1000L).toInt().coerceAtLeast(0)
-
-                    // Stop immediately if captain went offline, logged out, or accepted/removed the order
-                    if (db != null) {
-                        val captain = runCatching { db.captainDao().getCaptain() }.getOrNull()
-                        if (captain == null || !captain.isLoggedIn || !captain.isOnline) {
-                            Log.i(TAG, "Captain offline or logged out; stopping incoming order bell")
-                            stopBellAndFinish(removeNotification = true)
-                            return@launch
-                        }
-
-                        val trackedOrder = findTrackedOrder(db, orderId, orderKey)
-                        if (trackedOrder != null && trackedOrder.status != OrderStatus.PENDING) {
-                            Log.i(TAG, "Order status transitioned to ${trackedOrder.status}; stopping incoming order bell")
-                            stopBellAndFinish(removeNotification = true)
-                            return@launch
-                        }
-                    }
-
                     if (remainingSecs <= 0) {
                         Log.i(TAG, "60-second timer elapsed without acceptance; stopping bell & transferring to nearest captain")
                         stopSoundAndVibrationOnly()
@@ -310,25 +320,6 @@ class IncomingOrderBellService : Service() {
                         stopBellAndFinish(removeNotification = true)
                         return@launch
                     }
-
-                    // Refresh notification countdown text cleanly without re-alerting
-                    if (CaptainNotificationManager.hasNotificationPermission(applicationContext)) {
-                        val updated = buildRingingNotification(
-                            notificationId = notificationId,
-                            orderKey = orderKey,
-                            orderId = orderId,
-                            storeName = storeName,
-                            pickupAddress = pickupAddress,
-                            deliveryAddress = deliveryAddress,
-                            deliveryFee = deliveryFee,
-                            orderCode = orderCode,
-                            storeLocationUrl = storeLocationUrl,
-                            expiresAtMs = expiresAtMs,
-                            remainingSeconds = remainingSecs.coerceIn(1, 60)
-                        )
-                        runCatching { notifManager?.notify(notificationId, updated) }
-                    }
-
                     delay(1000L)
                 }
             } catch (_: CancellationException) {
