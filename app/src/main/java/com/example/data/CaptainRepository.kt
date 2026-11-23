@@ -2773,6 +2773,10 @@ class CaptainRepository(
 
         // One server read per five-minute GPS callback; never trust a stale local online flag.
         val serverCaptain = firestore.collection("captains").document(user.uid).get(Source.SERVER).await()
+        val lastServerLocationTimestamp = serverCaptain.getLong("lastLocationTimestamp") ?: 0L
+        if (lastServerLocationTimestamp > lastLocationUploadTimestamp) {
+            lastLocationUploadTimestamp = lastServerLocationTimestamp
+        }
         return serverCaptain.exists() &&
             serverCaptain.getBoolean("isOnline") == true &&
             serverCaptain.getString("workStatus") == "working" &&
