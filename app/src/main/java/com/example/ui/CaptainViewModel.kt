@@ -900,6 +900,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                     return
                 }
                 viewModelScope.launch {
+                    repository.setCaptainReadyStatus(true)
                     repository.setOnlineStatus(true)
                     if (repository.isEligibleForLocationTracking()) {
                         CaptainLocationTracker.startService(app)
@@ -930,6 +931,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                 _eventFlow.emit(UiEvent.ShowToast("تم منح إذن الموقع. لن يبدأ التتبع قبل بداية الشفت وتأكيد الجاهزية."))
                 return@launch
             }
+            repository.setCaptainReadyStatus(true)
             repository.setOnlineStatus(true)
             if (repository.isEligibleForLocationTracking()) {
                 CaptainLocationTracker.startService(app)
