@@ -29,6 +29,7 @@ import com.example.notifications.CaptainNotificationManager
 import com.example.notifications.ShiftNotificationScheduler
 import com.google.firebase.messaging.FirebaseMessaging
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -460,6 +461,9 @@ class CaptainRepository(
     }
 
     private val ordersListenerRegistrations = mutableListOf<ListenerRegistration>()
+    private var shiftSyncJob: Job? = null
+    private var shiftSyncUid: String? = null
+    private val shiftSyncIntervalMs = 30L * 60L * 1000L
     private var captainScheduleDocListenerRegistration: ListenerRegistration? = null
     private var captainScheduleSubcollectionListenerRegistration: ListenerRegistration? = null
     private var captainScheduleQueryListenerRegistration: ListenerRegistration? = null
@@ -1180,6 +1184,9 @@ class CaptainRepository(
      * Stops all active realtime listeners for shifts.
      */
     fun stopRealtimeShiftListener() {
+        shiftSyncJob?.cancel()
+        shiftSyncJob = null
+        shiftSyncUid = null
         captainScheduleDocListenerRegistration?.remove()
         captainScheduleDocListenerRegistration = null
         captainScheduleSubcollectionListenerRegistration?.remove()
@@ -1227,37 +1234,30 @@ class CaptainRepository(
             return
         }
         val uid = user.uid
+        if (shiftSyncJob?.isActive == true && shiftSyncUid == uid) return
+
         stopRealtimeShiftListener()
+        shiftSyncUid = uid
+        _isShiftNetworkConnected.value = true
+        Log.i("CaptainRepository", "[ShiftPolling] Starting 30-minute schedule polling for captain $uid")
 
-        Log.i("CaptainRepository", "[ShiftListener] Listening to canonical captain_schedules/$uid document")
-
-        captainScheduleDocListenerRegistration = firestore.collection("captain_schedules")
-            .document(uid)
-            .addSnapshotListener { snapshot, error ->
-                if (error != null) {
-                    Log.w("CaptainRepository", "[ShiftListener] Canonical schedule listener failed: ${error.message}")
-                    _isShiftNetworkConnected.value = false
-                    return@addSnapshotListener
+        shiftSyncJob = CoroutineScope(Dispatchers.IO).launch {
+            while (kotlin.coroutines.coroutineContext[kotlinx.coroutines.Job]?.isActive == true) {
+                if (runCatching { firebaseAuth.currentUser?.uid }.getOrNull() != uid) {
+                    Log.i("CaptainRepository", "[ShiftPolling] Auth session changed; stopping schedule polling")
+                    break
                 }
-                if (snapshot == null) return@addSnapshotListener
-
-                _isShiftNetworkConnected.value = !snapshot.metadata.isFromCache
-                CoroutineScope(Dispatchers.IO).launch {
-                    try {
-                        // The admin panel writes captain_schedules/{captainUid}.
-                        // Replace Room even when the schedule is empty or deleted, so removed shifts cannot linger.
-                        val latestShifts = if (snapshot.exists()) snapshot.extractAllShifts(uid) else emptyList()
-                        saveShiftsAndScheduleAlarms(uid, latestShifts)
-                        _isShiftSynced.value = true
-                        Log.i("CaptainRepository", "[ShiftListener] Replaced local schedule with ${latestShifts.size} canonical shifts")
-                    } catch (syncError: Exception) {
-                        Log.e("CaptainRepository", "[ShiftListener] Failed to apply canonical shifts", syncError)
-                        _isShiftSynced.value = false
-                    }
+                val result = syncShiftsFromFirestore()
+                _isShiftNetworkConnected.value = result.isSuccess
+                if (result.isSuccess) {
+                    Log.i("CaptainRepository", "[ShiftPolling] Schedule refreshed; next database read in 30 minutes")
+                } else {
+                    Log.w("CaptainRepository", "[ShiftPolling] Schedule refresh failed: ${result.exceptionOrNull()?.message}")
                 }
+                kotlinx.coroutines.delay(shiftSyncIntervalMs)
             }
+        }
     }
-
     internal suspend fun syncShiftsUsingResolvedSources(
         uid: String,
         canonicalDocExists: Boolean,
