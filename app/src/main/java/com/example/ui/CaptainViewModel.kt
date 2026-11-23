@@ -483,14 +483,16 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                             captainState.value?.isOnline == true &&
                             repository.isEligibleForLocationTracking()
                         if (wasReady) {
-                            repository.setOnlineStatus(true)
-                            if (CaptainLocationTracker.hasLocationPermission(appContext) &&
-                                CaptainLocationTracker.isGpsProviderEnabled(appContext)
-                            ) {
-                                CaptainLocationTracker.startService(appContext)
-                                repository.syncOrdersDetailedFromFirestore()
+                            if (!CaptainLocationTracker.hasLocationPermission(appContext)) {
+                                _eventFlow.emit(UiEvent.RequestLocationPermission)
+                            } else if (!CaptainLocationTracker.isGpsProviderEnabled(appContext)) {
+                                _eventFlow.emit(UiEvent.RequestGpsEnable)
                             } else {
-                                _eventFlow.emit(UiEvent.ShowToast("بدأ الشفت لكن يلزم تفعيل إذن الموقع وGPS لبدء استقبال الطلبات."))
+                                repository.setOnlineStatus(true)
+                                if (repository.isEligibleForLocationTracking()) {
+                                    CaptainLocationTracker.startService(appContext)
+                                    repository.syncOrdersDetailedFromFirestore()
+                                }
                             }
                         } else if (alreadyWorking) {
                             // Re-open a previously working session without asking the captain to confirm again.
