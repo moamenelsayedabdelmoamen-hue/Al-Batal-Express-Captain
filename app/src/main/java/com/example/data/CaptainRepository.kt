@@ -2750,15 +2750,15 @@ class CaptainRepository(
             serverCaptain.getBoolean("readyConfirmed") == true
     }
 
-    suspend fun updateCaptainGpsLocation(location: Location) {
-        if (!isEligibleForLocationTracking()) return
+    suspend fun updateCaptainGpsLocation(location: Location): Boolean {
+        if (!isEligibleForLocationTracking()) return false
         val user = firebaseAuth.currentUser ?: return
         val uid = user.uid
         if (uid.isBlank()) return
         val now = System.currentTimeMillis()
         val timeDiff = now - lastLocationUploadTimestamp
         // Fixed five-minute Firestore cadence. Movement and trip-state changes never bypass it.
-        if (lastLocationUploadTimestamp > 0L && timeDiff < GpsConfig.FIRESTORE_HEARTBEAT_INTERVAL_MS) return
+        if (lastLocationUploadTimestamp > 0L && timeDiff < GpsConfig.FIRESTORE_HEARTBEAT_INTERVAL_MS) return true
 
         val activeOrder = activeOrderFlow.firstOrNull()
         val presenceValue = if (activeOrder != null) "on_trip" else "working"
@@ -2784,8 +2784,10 @@ class CaptainRepository(
             lastLocationUploadTimestamp = now
             lastUploadedPresence = presenceValue
             Log.d("CaptainRepository", "Uploaded five-minute GPS location for working captain $uid")
+            return true
         } catch (e: Exception) {
             Log.e("CaptainRepository", "Error uploading location to Firestore", e)
+            return true // Keep service alive; the next five-minute tick can retry.
         }
     }
 
