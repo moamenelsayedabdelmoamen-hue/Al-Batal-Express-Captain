@@ -79,8 +79,12 @@ class NotificationsAndShiftAlarmsTest {
         )
 
         val triggers = ShiftNotificationScheduler.computeTriggersForShifts(shifts, nowMs)
-        // 2 active shifts => 4 triggers (start + end each), off-day skipped
-        assertEquals(4, triggers.size)
+        // 2 active shifts => 6 triggers (ready + start + end each), off-day skipped
+        assertEquals(6, triggers.size)
+        val sunReady = triggers.first { it.dayOfWeek == Calendar.SUNDAY && it.isReadyWindow }
+        val sunReadyCal = Calendar.getInstance(ShiftManager.CAIRO_TIME_ZONE).apply { timeInMillis = sunReady.triggerAtMillis }
+        assertEquals(11, sunReadyCal.get(Calendar.HOUR_OF_DAY))
+        assertEquals(30, sunReadyCal.get(Calendar.MINUTE))
 
         val sunStart = triggers.first { it.dayOfWeek == Calendar.SUNDAY && it.isStart }
         val sunEnd = triggers.first { it.dayOfWeek == Calendar.SUNDAY && !it.isStart }
@@ -134,7 +138,7 @@ class NotificationsAndShiftAlarmsTest {
         )
 
         val shadowAlarm = Shadows.shadowOf(alarmManager)
-        assertEquals(4, shadowAlarm.scheduledAlarms.size)
+        assertEquals(6, shadowAlarm.scheduledAlarms.size)
 
         ShiftNotificationScheduler.cancelAllShiftAlarms(appContext)
         assertEquals(0, shadowAlarm.scheduledAlarms.size)
@@ -186,7 +190,21 @@ class NotificationsAndShiftAlarmsTest {
         )
         assertFalse(duplicateOrderPosted)
 
-        // 2. Shift start & shift end notifications
+        // 2. Ready-window, shift start & shift end notifications
+        val readyPosted = CaptainNotificationManager.showShiftReadyWindowNotification(
+            context = appContext,
+            dayNameArabic = "الأحد",
+            startFormatted = "12:00 م",
+            endFormatted = "8:00 م",
+            dedupeKey = "2026-11-15_1_ready"
+        )
+        val readyDuplicate = CaptainNotificationManager.showShiftReadyWindowNotification(
+            context = appContext,
+            dayNameArabic = "الأحد",
+            startFormatted = "12:00 م",
+            endFormatted = "8:00 م",
+            dedupeKey = "2026-11-15_1_ready"
+        )
         val startPosted = CaptainNotificationManager.showShiftStartNotification(
             context = appContext,
             dayNameArabic = "الأحد",
@@ -207,14 +225,17 @@ class NotificationsAndShiftAlarmsTest {
             endFormatted = "8:00 م",
             dedupeKey = "2026-11-15_1_end"
         )
+        assertTrue(readyPosted)
+        assertFalse(readyDuplicate)
         assertTrue(startPosted)
         assertFalse(startDuplicate)
         assertTrue(endPosted)
 
         val posted = shadowNotif.allNotifications
-        assertEquals(3, posted.size)
+        assertEquals(4, posted.size)
         val titles = posted.map { it.extras.getString(Notification.EXTRA_TITLE).orEmpty() }
         assertTrue(titles.any { it.contains("طلب توصيل جديد") })
+        assertTrue(titles.any { it.contains("شفتك سيبدأ خلال 30 دقيقة") })
         assertTrue(titles.any { it.contains("بدأ شفت عملك") })
         assertTrue(titles.any { it.contains("انتهى شفت عملك") })
     }
