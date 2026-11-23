@@ -404,7 +404,12 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
     private var attachedApprovalUid: String? = null
 
     internal var startupSessionResolverOverride: (suspend () -> StartupSessionState)? = null
-    private var isResolvingStartupSession = false
+    // Startup auth/approval validation runs while the branded intro is visible.
+    // The operational session remains gated until BOTH checks have completed.
+    private var startupSessionCheckStarted = false
+    private var startupSessionCheckFinished = false
+    private var introVisualFinished = false
+    private var resolvedStartupSession: StartupSessionState? = null
 
     private val expiredOfferNotifiedIds = java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
@@ -1172,53 +1177,72 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /**
-     * Called once when the intro splash video finishes playing or encounters an error.
-     * Evaluates Firebase Authentication + server-side Admin Approval and navigates accordingly.
-     * Fail-closed: network errors or unapproved states NEVER enter Main.
+     * Starts Firebase Auth + server approval validation immediately while the intro is visible.
+     * This overlaps network/session work with the branded splash instead of waiting for video
+     * playback to finish before starting the most latency-sensitive startup operation.
      */
-    fun onIntroSplashFinished() {
-        if (_hasCompletedIntroSplash.value || isResolvingStartupSession) return
-        isResolvingStartupSession = true
+    fun prepareStartupSessionCheck() {
+        if (startupSessionCheckStarted || startupSessionCheckFinished) return
+        startupSessionCheckStarted = true
         viewModelScope.launch {
-            try {
-                val sessionState = startupSessionResolverOverride?.invoke()
+            val sessionState = try {
+                startupSessionResolverOverride?.invoke()
                     ?: repository.resolveStartupSessionState()
-                _hasCompletedIntroSplash.value = true
-                when (sessionState) {
-                    is StartupSessionState.Authenticated -> {
-                        attachCaptainApprovalListenerForCurrentUser()
-                        auth?.currentUser?.uid?.let { attachShiftSnapshotListeners(it) }
-                        _currentRoute.value = ScreenRoute.Main.route
-                    }
-                    is StartupSessionState.NeedsEmailVerification -> {
-                        detachCaptainApprovalListener()
-                        _unverifiedEmail.value = sessionState.email
-                        _currentRoute.value = ScreenRoute.VerifyEmail.route
-                    }
-                    is StartupSessionState.AwaitingApproval -> {
-                        attachCaptainApprovalListenerForCurrentUser()
-                        detachShiftSnapshotListeners()
-                        CaptainLocationTracker.stopService(getApplication())
-                        _currentRoute.value = ScreenRoute.AccountApproval.route
-                    }
-                    is StartupSessionState.ApprovalCheckFailed -> {
-                        detachShiftSnapshotListeners()
-                        CaptainLocationTracker.stopService(getApplication())
-                        _approvalFeedback.value = sessionState.approval.networkError
-                        _currentRoute.value = ScreenRoute.AccountApproval.route
-                    }
-                    is StartupSessionState.Unauthenticated -> {
-                        detachCaptainApprovalListener()
-                        detachShiftSnapshotListeners()
-                        _currentRoute.value = ScreenRoute.Login.route
-                    }
-                }
             } catch (e: Exception) {
                 Log.w("CaptainViewModel", "Startup session check fallback to Login: ${e.message}")
-                _hasCompletedIntroSplash.value = true
+                null
+            }
+            resolvedStartupSession = sessionState
+            startupSessionCheckFinished = true
+            if (introVisualFinished) {
+                completeStartupAfterChecks(sessionState)
+            }
+        }
+    }
+
+    /**
+     * Called when the intro video ends or its short startup budget expires.
+     * Navigation waits for the server approval result too; local cached approval never unlocks Main.
+     */
+    fun onIntroSplashFinished() {
+        if (introVisualFinished) return
+        introVisualFinished = true
+        prepareStartupSessionCheck()
+        if (startupSessionCheckFinished) {
+            completeStartupAfterChecks(resolvedStartupSession)
+        }
+    }
+
+    private fun completeStartupAfterChecks(sessionState: StartupSessionState?) {
+        if (_hasCompletedIntroSplash.value) return
+        _hasCompletedIntroSplash.value = true
+        when (sessionState) {
+            is StartupSessionState.Authenticated -> {
+                attachCaptainApprovalListenerForCurrentUser()
+                auth?.currentUser?.uid?.let { attachShiftSnapshotListeners(it) }
+                _currentRoute.value = ScreenRoute.Main.route
+            }
+            is StartupSessionState.NeedsEmailVerification -> {
+                detachCaptainApprovalListener()
+                _unverifiedEmail.value = sessionState.email
+                _currentRoute.value = ScreenRoute.VerifyEmail.route
+            }
+            is StartupSessionState.AwaitingApproval -> {
+                attachCaptainApprovalListenerForCurrentUser()
+                detachShiftSnapshotListeners()
+                CaptainLocationTracker.stopService(getApplication())
+                _currentRoute.value = ScreenRoute.AccountApproval.route
+            }
+            is StartupSessionState.ApprovalCheckFailed -> {
+                detachShiftSnapshotListeners()
+                CaptainLocationTracker.stopService(getApplication())
+                _approvalFeedback.value = sessionState.approval.networkError
+                _currentRoute.value = ScreenRoute.AccountApproval.route
+            }
+            is StartupSessionState.Unauthenticated, null -> {
+                detachCaptainApprovalListener()
+                detachShiftSnapshotListeners()
                 _currentRoute.value = ScreenRoute.Login.route
-            } finally {
-                isResolvingStartupSession = false
             }
         }
     }
