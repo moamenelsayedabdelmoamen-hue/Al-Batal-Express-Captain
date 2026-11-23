@@ -2896,7 +2896,20 @@ class CaptainRepository(
                 context?.let { CaptainNotificationManager.stopIncomingOrderBell(it) }
             }
         } catch (e: Exception) {
-            if (ready) captainDao.updateOnlineStatus(false)
+            captainDao.updateOnlineStatus(false)
+            if (!ready) {
+                runCatching {
+                    val currentUid = firebaseAuth.currentUser?.uid ?: return@runCatching
+                    firestore.collection("captains").document(currentUid).update(
+                        mapOf(
+                            "isOnline" to false,
+                            "presenceStatus" to "offline",
+                            "availabilityStatus" to "offline",
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
+                    ).await()
+                }
+            }
             Log.e("CaptainRepository", "Unable to update server-confirmed captain readiness", e)
             throw e
         }
