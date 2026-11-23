@@ -509,7 +509,10 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                         _eventFlow.emit(
                             UiEvent.ShowToast(
                                 when {
-                                    wasReady -> "بدأ شفتك. تم تحويل حالتك إلى يعمل الآن."
+                                    wasReady && CaptainLocationTracker.hasLocationPermission(appContext) &&
+                                        CaptainLocationTracker.isGpsProviderEnabled(appContext) ->
+                                        "بدأ شفتك. تم تحويل حالتك إلى يعمل الآن."
+                                    wasReady -> "أنت جاهز، لكن يلزم منح إذن الموقع وتشغيل GPS قبل بدء استقبال الطلبات."
                                     alreadyWorking -> "تم استعادة جلسة عملك الحالية."
                                     else -> "بدأ شفتك. لم يتم تسجيل تأكيد جاهزية لهذا الشفت."
                                 }
