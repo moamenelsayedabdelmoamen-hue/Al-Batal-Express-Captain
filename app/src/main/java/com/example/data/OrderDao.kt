@@ -19,7 +19,7 @@ interface OrderDao {
     @Query("""
         SELECT * FROM orders
         WHERE (:orderId > 0 AND id = :orderId)
-           OR (:orderKey != '' AND (firestoreDocId = :orderKey OR cleanOrderNumber = :orderKey))
+           OR (:orderKey != '' AND (firestoreDocId = :orderKey OR TRIM(LTRIM(TRIM(orderNumber), '#')) = :orderKey))
         LIMIT 1
     """)
     fun observeTrackedOrder(orderId: Long, orderKey: String): Flow<OrderEntity?>
