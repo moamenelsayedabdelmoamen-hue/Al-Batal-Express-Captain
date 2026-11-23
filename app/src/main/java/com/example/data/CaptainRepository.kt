@@ -2914,6 +2914,12 @@ class CaptainRepository(
         try {
             val uid = authBackend.currentUser()?.uid
             if (!uid.isNullOrBlank()) {
+                runCatching {
+                    FirebaseFunctions.getInstance()
+                        .getHttpsCallable("updateCaptainShiftPresence")
+                        .call(mapOf("action" to "offline"))
+                        .await()
+                }
                 firestore.collection("captains").document(uid).update(
                     mapOf(
                         "isLoggedIn" to false,
