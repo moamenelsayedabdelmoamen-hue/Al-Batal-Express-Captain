@@ -345,7 +345,7 @@ class FirebaseStorageRepository(
         }
 
         // Explicit allowlist of order statuses permitted for receipt upload (matches storage.rules 1:1).
-        // Any unknown, early (PENDING, ACCEPTED, AT_STORE), EN_ROUTE, or closed (DELIVERED, CANCELLED, EXPIRED) status is rejected.
+        // Upload is allowed after the captain marks arrival (AT_STORE) and before delivery or cancellation.
         if (orderStatus !in ALLOWED_RECEIPT_UPLOAD_STATUSES) {
             val ex = StorageUploadException(
                 "لا يمكن رفع أو استبدال إيصال الطلب في الحالة الحالية. يُسمح بالرفع فقط بعد استلام الطلب من التاجر وقبل إغلاق الطلب.",
@@ -813,6 +813,7 @@ class FirebaseStorageRepository(
         const val MAX_DOWNLOAD_BYTES = 10L * 1024L * 1024L
 
         val ALLOWED_RECEIPT_UPLOAD_STATUSES = setOf(
+            OrderStatus.AT_STORE,
             OrderStatus.PICKED_UP,
             OrderStatus.MERCHANT_REJECTED,
             OrderStatus.AWAITING_MERCHANT_CONFIRMATION
