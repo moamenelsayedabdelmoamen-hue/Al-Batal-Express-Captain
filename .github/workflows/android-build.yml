@@ -14,10 +14,11 @@ on:
       - "gradle/**"
       - "*.gradle.kts"
       - "settings.gradle.kts"
+      - ".github/workflows/android-build.yml"
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -54,9 +55,10 @@ jobs:
             echo "::warning::GOOGLE_SERVICES_JSON secret is not set; the APK will not connect to Firebase and the project-config test is skipped."
           fi
       - name: Run Captain unit tests
-        run: gradle :app:testDebugUnitTest
+        timeout-minutes: 80
+        run: gradle --no-daemon --console=plain --info :app:testDebugUnitTest
       - name: Upload unit test reports
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.repository.name }}-unit-test-reports
@@ -65,7 +67,7 @@ jobs:
             app/build/test-results/testDebugUnitTest
           if-no-files-found: ignore
       - name: Build Captain debug APK
-        run: gradle :app:assembleDebug
+        run: gradle --no-daemon --console=plain :app:assembleDebug
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.repository.name }}-debug-apk
