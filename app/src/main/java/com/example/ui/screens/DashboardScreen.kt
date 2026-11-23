@@ -45,6 +45,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -759,12 +760,14 @@ fun DashboardScreen(
             } else {
                 // List of available trip cards
                 availableOrders.forEach { availableOrder ->
-                    AvailableTripCard(
-                        order = availableOrder,
-                        isLoading = isLoading,
-                        onAcceptOrder = { onAcceptOrder(it) }
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
+                    key(availableOrder.id) {
+                        AvailableTripCard(
+                            order = availableOrder,
+                            isLoading = isLoading,
+                            onAcceptOrder = onAcceptOrder
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                    }
                 }
             }
 

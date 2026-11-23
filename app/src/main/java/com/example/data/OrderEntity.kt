@@ -1,5 +1,6 @@
 package com.example.data
 
+import androidx.compose.runtime.Immutable
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 
@@ -33,6 +34,7 @@ fun resolveMerchantImageReference(storeImage: String?, storeImagePath: String?):
     }
 }
 
+@Immutable
 @Entity(tableName = "orders")
 data class OrderEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
