@@ -438,15 +438,22 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         ensureFirebaseInitialized()
         CaptainNotificationManager.ensureNotificationChannels(appContext)
 
-        // Dynamic live ticker updating Cairo clock, shift status transitions, and 1:00 PM wallet rollover every second
+        // Check shift boundaries every second, but only publish UI state when its displayed value changes.
         viewModelScope.launch {
             var previousLoadedShiftStatus: ShiftStatus? = null
+            var lastClockUiUpdateMs = 0L
             while (true) {
-                _currentCairoTime.value = ShiftManager.getCurrentCairoTimeFormatted()
-                _currentCairoDate.value = ShiftManager.getCurrentCairoDateFormatted()
+                val nowMs = System.currentTimeMillis()
+                if (nowMs - lastClockUiUpdateMs >= 15_000L) {
+                    val nextTime = ShiftManager.getCurrentCairoTimeFormatted()
+                    if (_currentCairoTime.value != nextTime) _currentCairoTime.value = nextTime
+                    val nextDate = ShiftManager.getCurrentCairoDateFormatted()
+                    if (_currentCairoDate.value != nextDate) _currentCairoDate.value = nextDate
+                    lastClockUiUpdateMs = nowMs
+                }
                 val currentShiftsList = shifts.value
                 val latestShiftStatus = ShiftManager.calculateShiftStatus(currentShiftsList)
-                _shiftStatus.value = latestShiftStatus
+                if (_shiftStatus.value != latestShiftStatus) _shiftStatus.value = latestShiftStatus
 
                 if (currentShiftsList.isNotEmpty() && captainState.value?.isLoggedIn == true) {
                     val prev = previousLoadedShiftStatus
