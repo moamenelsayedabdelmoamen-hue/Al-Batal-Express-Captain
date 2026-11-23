@@ -92,7 +92,7 @@ fun ActiveOrderCard(
 
     val statusTitle = when (order.status) {
         OrderStatus.ACCEPTED -> "١. في الطريق إلى مقر التاجر"
-        OrderStatus.AT_STORE -> "٢. تم الوصول للتاجر - قم باستلام الطلب"
+        OrderStatus.AT_STORE -> "٢. تم الوصول للتاجر - سجل بيانات الطلب والإيصال"
         OrderStatus.PICKED_UP -> "٣. تم الاستلام - أدخل بيانات العميل والإيصال"
         OrderStatus.ORDER_DATA_ENTERED,
         OrderStatus.AWAITING_MERCHANT_CONFIRMATION -> "٤. بانتظار تأكيد التاجر ومراجعته للبيانات"
@@ -378,10 +378,10 @@ fun ActiveOrderCard(
                     }
                 }
 
-                // 2. AT_STORE: "استلام الطلب"
+                // 2. AT_STORE: captain records customer data and receipt immediately after arrival.
                 OrderStatus.AT_STORE -> {
                     Button(
-                        onClick = { onConfirmPickup(order.id) },
+                        onClick = { onOpenCustomerDataEntry(order) },
                         enabled = !isLoading,
                         modifier = Modifier
                             .fillMaxWidth()
@@ -392,7 +392,7 @@ fun ActiveOrderCard(
                         Icon(Icons.Default.Storefront, contentDescription = null, modifier = Modifier.size(22.dp))
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "استلام الطلب من التاجر 📦",
+                            text = "تسجيل بيانات الطلب والإيصال 📷",
                             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
                         )
                     }
