@@ -407,10 +407,6 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
     internal var startupSessionResolverOverride: (suspend () -> StartupSessionState)? = null
     // Startup auth/approval validation runs while the branded intro is visible.
     // The operational session remains gated until BOTH checks have completed.
-    private companion object {
-        const val STARTUP_SESSION_CHECK_TIMEOUT_MS = 8_000L
-    }
-
     private var startupSessionCheckStarted = false
     private var startupSessionCheckFinished = false
     private var introVisualFinished = false
@@ -2049,6 +2045,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
     }
 
     companion object {
+        const val STARTUP_SESSION_CHECK_TIMEOUT_MS = 8_000L
         private val BLOCKED_ACCOUNT_STATUSES = setOf("banned", "suspended", "disabled", "blocked")
         private val INACTIVE_ACCOUNT_STATUSES = BLOCKED_ACCOUNT_STATUSES + setOf("pending", "inactive")
 
