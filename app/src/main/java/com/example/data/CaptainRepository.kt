@@ -492,14 +492,13 @@ class CaptainRepository(
                 // 1. Only start listeners if already authenticated AND email is verified
                 val existingUser = firebaseAuth.currentUser
                 if (existingUser != null && existingUser.isEmailVerified) {
-                    startRealtimeOrdersListener()
+                    // Keep only the schedule listener active; order listeners start when working.
                     startRealtimeShiftListener()
                 }
                 // 2. Listen to Auth State changes and require verified Firebase user
                 firebaseAuth.addAuthStateListener { auth ->
                     val user = auth.currentUser
                     if (user != null && user.isEmailVerified) {
-                        startRealtimeOrdersListener()
                         startRealtimeShiftListener()
                     } else {
                         stopRealtimeOrdersListener()
@@ -2724,29 +2723,28 @@ class CaptainRepository(
     private var lastLocationUploadTimestamp: Long = 0L
     private var lastUploadedPresence: String? = null
 
+    /** Fail-closed local guard; server independently validates workStatus, schedule and GPS freshness. */
+    suspend fun isEligibleForLocationTracking(): Boolean {
+        if (_accountApprovalState.value != null && !isCurrentSessionApproved) return false
+        val user = firebaseAuth.currentUser ?: return false
+        if (!user.isEmailVerified) return false
+        val captain = captainDao.getCaptain() ?: return false
+        if (!captain.isOnline) return false
+        return ShiftManager.calculateShiftStatus(getShifts()) is ShiftStatus.Active
+    }
+
     suspend fun updateCaptainGpsLocation(location: Location) {
-        if (_accountApprovalState.value != null && !isCurrentSessionApproved) return
+        if (!isEligibleForLocationTracking()) return
         val user = firebaseAuth.currentUser ?: return
-        if (!user.isEmailVerified) return
         val uid = user.uid
         if (uid.isBlank()) return
-
         val now = System.currentTimeMillis()
-        val lastLoc = lastUploadedLocation
-        val distance = if (lastLoc != null) location.distanceTo(lastLoc) else Float.MAX_VALUE
         val timeDiff = now - lastLocationUploadTimestamp
+        // Fixed five-minute Firestore cadence. Movement and trip-state changes never bypass it.
+        if (lastLocationUploadTimestamp > 0L && timeDiff < GpsConfig.FIRESTORE_HEARTBEAT_INTERVAL_MS) return
 
         val activeOrder = activeOrderFlow.firstOrNull()
-        val presenceValue = if (activeOrder != null) "on_trip" else "available"
-
-        // Smart Throttling: send only if moved >= MIN_DISPLACEMENT_METERS, the heartbeat interval elapsed,
-        // or the trip state changed (a stale "on_trip" keeps the captain out of dispatch).
-        if (lastLoc != null && distance < GpsConfig.MIN_DISPLACEMENT_METERS &&
-            timeDiff < GpsConfig.FIRESTORE_HEARTBEAT_INTERVAL_MS && presenceValue == lastUploadedPresence
-        ) {
-            return
-        }
-
+        val presenceValue = if (activeOrder != null) "on_trip" else "working"
         val locationData = hashMapOf<String, Any>(
             "location" to GeoPoint(location.latitude, location.longitude),
             "latitude" to location.latitude,
@@ -2755,21 +2753,22 @@ class CaptainRepository(
             "bearing" to location.bearing.toDouble(),
             "speed" to location.speed.toDouble(),
             "isOnline" to true,
+            "workStatus" to "working",
+            "readyConfirmed" to true,
             "presenceStatus" to presenceValue,
             "availabilityStatus" to presenceValue,
             "lastLocationUpdate" to FieldValue.serverTimestamp(),
             "lastLocationTimestamp" to now,
             "updatedAt" to FieldValue.serverTimestamp()
         )
-
         try {
             firestore.collection("captains").document(uid).update(locationData).await()
             lastUploadedLocation = location
             lastLocationUploadTimestamp = now
             lastUploadedPresence = presenceValue
-            Log.d("CaptainRepository", "Uploaded GPS location to Firestore for captain $uid: ${location.latitude}, ${location.longitude}")
+            Log.d("CaptainRepository", "Uploaded five-minute GPS location for working captain $uid")
         } catch (e: Exception) {
-            Log.e("CaptainRepository", "Error uploading GPS location to Firestore", e)
+            Log.e("CaptainRepository", "Error uploading location to Firestore", e)
         }
     }
 
@@ -2806,7 +2805,11 @@ class CaptainRepository(
     }
 
     suspend fun setOnlineStatus(isOnline: Boolean) {
-        if (isOnline && _accountApprovalState.value != null && !isCurrentSessionApproved) {
+        if (isOnline && (_accountApprovalState.value != null && !isCurrentSessionApproved)) {
+            captainDao.updateOnlineStatus(false)
+            return
+        }
+        if (isOnline && ShiftManager.calculateShiftStatus(getShifts()) !is ShiftStatus.Active) {
             captainDao.updateOnlineStatus(false)
             return
         }
@@ -2818,19 +2821,51 @@ class CaptainRepository(
         val uid = runCatching { authBackend.currentUser()?.uid }.getOrNull()?.takeIf { it.isNotBlank() }
             ?: runCatching { cloudMetadataPort.currentAuthUid() }.getOrNull()?.takeIf { it.isNotBlank() }
         if (!uid.isNullOrBlank()) {
-            val statusValue = if (isOnline) "available" else "offline"
+            val statusValue = if (isOnline) "working" else "offline"
             val statusMap = mapOf<String, Any>(
                 "isOnline" to isOnline,
+                "workStatus" to if (isOnline) "working" else "off_shift",
+                "readyConfirmed" to isOnline,
                 "presenceStatus" to statusValue,
                 "availabilityStatus" to statusValue,
                 "updatedAt" to FieldValue.serverTimestamp()
             )
             try {
-                firestore.collection("captains").document(uid).update(statusMap)
+                firestore.collection("captains").document(uid).update(statusMap).await()
             } catch (e: Exception) {
                 Log.e("CaptainRepository", "Error updating online status in Firestore", e)
             }
         }
+    }
+
+    /** Records the captain's explicit confirmation during the 30-minute pre-shift window. */
+    suspend fun setCaptainReadyStatus(ready: Boolean) {
+        if (ready && (_accountApprovalState.value != null && !isCurrentSessionApproved)) return
+        val status = ShiftManager.calculateShiftStatus(getShifts())
+        val inReadyWindow = status is ShiftStatus.UpcomingSoon &&
+            status.millisUntilStart in 1L..(30L * 60_000L)
+        if (ready && !inReadyWindow) return
+        captainDao.updateOnlineStatus(ready)
+        if (!ready) {
+            orderDao.deleteAllPendingOrders()
+            context?.let { CaptainNotificationManager.stopIncomingOrderBell(it) }
+        }
+        val uid = runCatching { authBackend.currentUser()?.uid }.getOrNull()?.takeIf { it.isNotBlank() }
+            ?: runCatching { cloudMetadataPort.currentAuthUid() }.getOrNull()?.takeIf { it.isNotBlank() }
+            ?: return
+        val state = if (ready) "ready" else "off_shift"
+        val presence = if (ready) "ready" else "offline"
+        firestore.collection("captains").document(uid).update(
+            mapOf(
+                "isOnline" to ready,
+                "workStatus" to state,
+                "readyConfirmed" to ready,
+                "presenceStatus" to presence,
+                "availabilityStatus" to presence,
+                "readyConfirmedAt" to if (ready) FieldValue.serverTimestamp() else FieldValue.delete(),
+                "updatedAt" to FieldValue.serverTimestamp()
+            )
+        ).await()
     }
 
     suspend fun logout() {
