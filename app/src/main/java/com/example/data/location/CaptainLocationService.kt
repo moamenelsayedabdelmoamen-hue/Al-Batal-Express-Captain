@@ -96,6 +96,18 @@ class CaptainLocationService : Service() {
     }
 
     private fun startLocationTracking() {
+        serviceScope.launch {
+            val eligible = runCatching { repository?.isEligibleForLocationTracking() == true }.getOrDefault(false)
+            if (!eligible) {
+                Log.w(TAG, "GPS start denied: captain is not confirmed working inside the active shift")
+                stopLocationTracking()
+                return@launch
+            }
+            startLocationTrackingAuthorized()
+        }
+    }
+
+    private fun startLocationTrackingAuthorized() {
         if (!CaptainLocationTracker.hasLocationPermission(this)) {
             Log.w(TAG, "Location permission missing, stopping service")
             CaptainLocationTracker.updateStatus(GpsStatus.PermissionDenied)
