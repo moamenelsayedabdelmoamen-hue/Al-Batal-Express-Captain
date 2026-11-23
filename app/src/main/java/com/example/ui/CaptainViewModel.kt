@@ -449,29 +449,66 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
 
                 if (currentShiftsList.isNotEmpty() && captainState.value?.isLoggedIn == true) {
                     val prev = previousLoadedShiftStatus
-                    if (prev != null) {
-                        if (prev !is ShiftStatus.Active && latestShiftStatus is ShiftStatus.Active) {
-                            CaptainNotificationManager.showShiftStartNotification(
-                                context = appContext,
-                                dayNameArabic = latestShiftStatus.shift.dayNameArabic,
-                                startFormatted = latestShiftStatus.startFormatted,
-                                endFormatted = latestShiftStatus.endFormatted,
-                                dedupeKey = ShiftNotificationScheduler.buildTodayDedupeKey(latestShiftStatus.shift, isStart = true)
-                            )
-                            _eventFlow.emit(
-                                UiEvent.ShowToast("بدأ شفت عملك الآن (${latestShiftStatus.startFormatted} - ${latestShiftStatus.endFormatted})")
-                            )
-                        } else if (prev is ShiftStatus.Active && latestShiftStatus !is ShiftStatus.Active) {
-                            CaptainNotificationManager.showShiftEndNotification(
-                                context = appContext,
-                                dayNameArabic = prev.shift.dayNameArabic,
-                                endFormatted = prev.endFormatted,
-                                dedupeKey = ShiftNotificationScheduler.buildTodayDedupeKey(prev.shift, isStart = false)
-                            )
-                            _eventFlow.emit(
-                                UiEvent.ShowToast("انتهى شفت عملك اليوم (${prev.endFormatted}). تم إيقاف استقبال الطلبات.")
-                            )
+                    val dedupeKey = when (latestShiftStatus) {
+                        is ShiftStatus.UpcomingSoon -> ShiftNotificationScheduler.buildTodayDedupeKey(latestShiftStatus.shift, isStart = true) + "_ready"
+                        is ShiftStatus.Active -> ShiftNotificationScheduler.buildTodayDedupeKey(latestShiftStatus.shift, isStart = true)
+                        else -> ""
+                    }
+
+                    if (latestShiftStatus is ShiftStatus.UpcomingSoon &&
+                        latestShiftStatus.millisUntilStart in 1L..(30L * 60_000L) &&
+                        (prev !is ShiftStatus.UpcomingSoon || prev.shift.id != latestShiftStatus.shift.id ||
+                            prev.millisUntilStart > 30L * 60_000L)
+                    ) {
+                        CaptainNotificationManager.showShiftReadyWindowNotification(
+                            context = appContext,
+                            dayNameArabic = latestShiftStatus.shift.dayNameArabic,
+                            startFormatted = latestShiftStatus.startFormatted,
+                            endFormatted = latestShiftStatus.endFormatted,
+                            dedupeKey = dedupeKey
+                        )
+                    }
+
+                    if (prev !is ShiftStatus.Active && latestShiftStatus is ShiftStatus.Active) {
+                        CaptainNotificationManager.showShiftStartNotification(
+                            context = appContext,
+                            dayNameArabic = latestShiftStatus.shift.dayNameArabic,
+                            startFormatted = latestShiftStatus.startFormatted,
+                            endFormatted = latestShiftStatus.endFormatted,
+                            dedupeKey = ShiftNotificationScheduler.buildTodayDedupeKey(latestShiftStatus.shift, isStart = true)
+                        )
+                        val wasReady = captainState.value?.isOnline == true
+                        if (wasReady) {
+                            repository.setOnlineStatus(true)
+                            if (CaptainLocationTracker.hasLocationPermission(appContext) &&
+                                CaptainLocationTracker.isGpsProviderEnabled(appContext)
+                            ) {
+                                CaptainLocationTracker.startService(appContext)
+                                repository.syncOrdersDetailedFromFirestore()
+                            } else {
+                                _eventFlow.emit(UiEvent.ShowToast("بدأ الشفت لكن يلزم تفعيل إذن الموقع وGPS لبدء استقبال الطلبات."))
+                            }
                         }
+                        _eventFlow.emit(
+                            UiEvent.ShowToast(
+                                if (wasReady) "بدأ شفتك. تم تحويل حالتك إلى يعمل الآن."
+                                else "بدأ شفتك. اضغط زر جاهز/بدء العمل لتأكيد حضورك."
+                            )
+                        )
+                    } else if (prev is ShiftStatus.Active && latestShiftStatus !is ShiftStatus.Active) {
+                        CaptainLocationTracker.stopService(appContext)
+                        if (captainState.value?.isOnline == true) {
+                            repository.setOnlineStatus(false)
+                        }
+                        CaptainNotificationManager.showShiftEndNotification(
+                            context = appContext,
+                            dayNameArabic = prev.shift.dayNameArabic,
+                            endFormatted = prev.endFormatted,
+                            dedupeKey = ShiftNotificationScheduler.buildTodayDedupeKey(prev.shift, isStart = false)
+                        )
+                        _eventFlow.emit(
+                            UiEvent.ShowToast("انتهى شفت العمل. تم إيقاف استقبال الطلبات وتتبع الموقع.")
+                        )
                     }
                     previousLoadedShiftStatus = latestShiftStatus
                 }
@@ -654,16 +691,22 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         val app = getApplication<Application>()
         if (CaptainLocationTracker.isTracking.value) return
         if (auth?.currentUser?.isEmailVerified != true) return
-        if (!CaptainLocationTracker.hasLocationPermission(app)) {
-            viewModelScope.launch { _eventFlow.emit(UiEvent.RequestLocationPermission) }
-            return
+        viewModelScope.launch {
+            if (!repository.isEligibleForLocationTracking()) {
+                CaptainLocationTracker.stopService(app)
+                return@launch
+            }
+            if (!CaptainLocationTracker.hasLocationPermission(app)) {
+                _eventFlow.emit(UiEvent.RequestLocationPermission)
+                return@launch
+            }
+            if (!CaptainLocationTracker.isGpsProviderEnabled(app)) {
+                _eventFlow.emit(UiEvent.RequestGpsEnable)
+                return@launch
+            }
+            runCatching { CaptainLocationTracker.startService(app) }
+                .onFailure { Log.w("CaptainViewModel", "Could not resume location service: ${it.message}") }
         }
-        if (!CaptainLocationTracker.isGpsProviderEnabled(app)) {
-            viewModelScope.launch { _eventFlow.emit(UiEvent.RequestGpsEnable) }
-            return
-        }
-        runCatching { CaptainLocationTracker.startService(app) }
-            .onFailure { Log.w("CaptainViewModel", "Could not resume location service: ${it.message}") }
     }
 
     /**
@@ -774,54 +817,74 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
 
     fun toggleOnlineStatus() {
         val app = getApplication<Application>()
-        val current = captainState.value?.isOnline ?: false
-        val newStatus = !current
+        val currentlyOnline = captainState.value?.isOnline == true
+        val status = _shiftStatus.value
 
-        if (newStatus && repository.accountApprovalState.value != null && !repository.isCurrentSessionApproved) {
+        if (currentlyOnline) {
+            CaptainNotificationManager.stopIncomingOrderBell(app)
+            CaptainLocationTracker.stopService(app)
             viewModelScope.launch {
-                _eventFlow.emit(UiEvent.ShowToast("حسابك غير معتمد حالياً من الإدارة ولا يمكنك تفعيل الاتصال."))
+                if (status is ShiftStatus.UpcomingSoon) {
+                    repository.setCaptainReadyStatus(false)
+                    _eventFlow.emit(UiEvent.ShowToast("تم إلغاء تأكيد الجاهزية لهذا الشفت."))
+                } else {
+                    repository.setOnlineStatus(false)
+                    _eventFlow.emit(UiEvent.ShowToast("أنت الآن غير متصل. تم إيقاف استقبال الطلبات وتتبع الموقع."))
+                }
             }
             return
         }
 
-        if (newStatus) {
-            // 1. Check Permissions
-            if (!CaptainLocationTracker.hasLocationPermission(app)) {
-                viewModelScope.launch {
-                    _eventFlow.emit(UiEvent.RequestLocationPermission)
-                }
-                return
-            }
-
-            // 2. Check GPS Hardware Provider
-            if (!CaptainLocationTracker.isGpsProviderEnabled(app)) {
-                viewModelScope.launch {
-                    _eventFlow.emit(UiEvent.RequestGpsEnable)
-                    _eventFlow.emit(UiEvent.ShowToast("يرجى تشغيل الـ GPS من إعدادات الهاتف لتفعيل الاتصال"))
-                }
-                return
-            }
-
-            // 3. Start Live GPS Foreground Service
-            CaptainLocationTracker.startService(app)
+        if (repository.accountApprovalState.value != null && !repository.isCurrentSessionApproved) {
             viewModelScope.launch {
-                repository.setOnlineStatus(true)
-                if (_shiftStatus.value.isAvailableForOrders) {
-                    if (auth?.currentUser?.isEmailVerified == true) {
-                        repository.syncOrdersDetailedFromFirestore()
+                _eventFlow.emit(UiEvent.ShowToast("حسابك غير معتمد حالياً من الإدارة ولا يمكنك تأكيد الجاهزية."))
+            }
+            return
+        }
+
+        when (status) {
+            is ShiftStatus.UpcomingSoon -> {
+                if (status.millisUntilStart > 30L * 60_000L) {
+                    viewModelScope.launch {
+                        _eventFlow.emit(UiEvent.ShowToast("زر جاهز سيتاح قبل بداية الشفت بـ30 دقيقة فقط."))
                     }
-                    _eventFlow.emit(UiEvent.ShowToast("أنت الآن متصل ومتاح لاستقبال الرحلات عبر الـ GPS ⚡"))
-                } else {
-                    _eventFlow.emit(UiEvent.ShowToast("تم تفعيل الاتصال، لكن استقبال الطلبات متوقف حالياً لأنك خارج ساعات الشفت"))
+                    return
+                }
+                viewModelScope.launch {
+                    runCatching { repository.setCaptainReadyStatus(true) }
+                        .onSuccess {
+                            _eventFlow.emit(UiEvent.ShowToast("تم تسجيلك جاهزاً. سيتم تفعيل العمل وGPS تلقائياً عند بداية الشفت."))
+                        }
+                        .onFailure {
+                            _eventFlow.emit(UiEvent.ShowToast("تعذر تسجيل الجاهزية. تحقق من اتصال الإنترنت وحاول مرة أخرى."))
+                        }
                 }
             }
-        } else {
-            // Stop GPS Tracking Service & incoming order bell immediately
-            CaptainNotificationManager.stopIncomingOrderBell(app)
-            CaptainLocationTracker.stopService(app)
-            viewModelScope.launch {
-                repository.setOnlineStatus(false)
-                _eventFlow.emit(UiEvent.ShowToast("أنت الآن غير متصل. تم إيقاف استقبال الطلبات وتتبع الموقع."))
+            is ShiftStatus.Active -> {
+                if (!CaptainLocationTracker.hasLocationPermission(app)) {
+                    viewModelScope.launch { _eventFlow.emit(UiEvent.RequestLocationPermission) }
+                    return
+                }
+                if (!CaptainLocationTracker.isGpsProviderEnabled(app)) {
+                    viewModelScope.launch {
+                        _eventFlow.emit(UiEvent.RequestGpsEnable)
+                        _eventFlow.emit(UiEvent.ShowToast("يرجى تشغيل GPS لبدء العمل واستقبال الطلبات."))
+                    }
+                    return
+                }
+                viewModelScope.launch {
+                    repository.setOnlineStatus(true)
+                    if (repository.isEligibleForLocationTracking()) {
+                        CaptainLocationTracker.startService(app)
+                        if (auth?.currentUser?.isEmailVerified == true) {
+                            repository.syncOrdersDetailedFromFirestore()
+                        }
+                        _eventFlow.emit(UiEvent.ShowToast("أنت الآن تعمل داخل الشفت ويمكنك استقبال الطلبات."))
+                    }
+                }
+            }
+            else -> viewModelScope.launch {
+                _eventFlow.emit(UiEvent.ShowToast("لا يمكنك الاتصال خارج الشفت. سيظهر زر جاهز قبل بداية الشفت بـ30 دقيقة."))
             }
         }
     }
@@ -831,20 +894,24 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         if (!CaptainLocationTracker.isGpsProviderEnabled(app)) {
             viewModelScope.launch {
                 _eventFlow.emit(UiEvent.RequestGpsEnable)
-                _eventFlow.emit(UiEvent.ShowToast("تم منح الإذن! يرجى تشغيل الـ GPS لتصبح متصلاً"))
+                _eventFlow.emit(UiEvent.ShowToast("تم منح الإذن. يرجى تشغيل GPS لبدء العمل."))
             }
-        } else {
-            CaptainLocationTracker.startService(app)
-            viewModelScope.launch {
-                repository.setOnlineStatus(true)
-                if (_shiftStatus.value.isAvailableForOrders) {
-                    if (auth?.currentUser?.isEmailVerified == true) {
-                        repository.syncOrdersDetailedFromFirestore()
-                    }
-                    _eventFlow.emit(UiEvent.ShowToast("تم تفعيل الـ GPS والاتصال بنجاح! ⚡"))
-                } else {
-                    _eventFlow.emit(UiEvent.ShowToast("تم تفعيل الاتصال، لكن لا يتم إسناد طلبات خارج ساعات الشفت"))
+            return
+        }
+        viewModelScope.launch {
+            if (_shiftStatus.value !is ShiftStatus.Active) {
+                _eventFlow.emit(UiEvent.ShowToast("تم منح إذن الموقع. لن يبدأ التتبع قبل بداية الشفت وتأكيد الجاهزية."))
+                return@launch
+            }
+            repository.setOnlineStatus(true)
+            if (repository.isEligibleForLocationTracking()) {
+                CaptainLocationTracker.startService(app)
+                if (auth?.currentUser?.isEmailVerified == true) {
+                    repository.syncOrdersDetailedFromFirestore()
                 }
+                _eventFlow.emit(UiEvent.ShowToast("بدأ العمل وتم تفعيل GPS بنجاح."))
+            } else {
+                _eventFlow.emit(UiEvent.ShowToast("لا يمكن تشغيل GPS قبل تأكيد الجاهزية وداخل الشفت."))
             }
         }
     }
