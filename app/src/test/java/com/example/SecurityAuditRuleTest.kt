@@ -455,7 +455,6 @@ class SecurityAuditRuleTest {
         val disallowedStatuses = listOf(
             OrderStatus.PENDING,
             OrderStatus.ACCEPTED,
-            OrderStatus.AT_STORE,
             OrderStatus.EN_ROUTE,
             OrderStatus.DELIVERED,
             OrderStatus.CANCELLED,
@@ -473,7 +472,7 @@ class SecurityAuditRuleTest {
         }
 
         // Allowed receipt statuses MUST succeed
-        for (goodStatus in listOf(OrderStatus.PICKED_UP, OrderStatus.MERCHANT_REJECTED, OrderStatus.AWAITING_MERCHANT_CONFIRMATION)) {
+        for (goodStatus in listOf(OrderStatus.AT_STORE, OrderStatus.PICKED_UP, OrderStatus.MERCHANT_REJECTED, OrderStatus.AWAITING_MERCHANT_CONFIRMATION)) {
             val res = storageRepo.uploadOrderReceiptImage(
                 orderId = "ORD_1",
                 assignedCaptainId = "captain_1",
