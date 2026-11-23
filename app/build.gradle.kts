@@ -62,7 +62,8 @@ android {
       // Print the full cause of a failing test in CI logs instead of only "Exception at File.kt:line".
       all {
         it.testLogging {
-          events("failed")
+          events("started", "passed", "skipped", "failed")
+          showStandardStreams = true
           exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
           showCauses = true
           showStackTraces = true
