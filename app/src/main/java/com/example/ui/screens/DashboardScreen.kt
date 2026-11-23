@@ -241,7 +241,7 @@ fun DashboardScreen(
                             onCheckedChange = { onToggleOnline() },
                             colors = SwitchDefaults.colors(
                                 checkedThumbColor = Color.White,
-                                checkedTrackColor = if (isReadyWindow) HeroYellow else StatusOnlineGreen,
+                                checkedTrackColor = if (isReadyWindow || (shiftStatus is ShiftStatus.Active && gpsStatus !is GpsStatus.Active)) HeroYellow else StatusOnlineGreen,
                                 uncheckedThumbColor = Color.LightGray,
                                 uncheckedTrackColor = DarkSurfaceVariant
                             )
@@ -249,7 +249,8 @@ fun DashboardScreen(
                         Text(
                             text = when {
                                 captain?.isOnline == true && isReadyWindow -> "جاهز"
-                                captain?.isOnline == true && shiftStatus is ShiftStatus.Active -> "يعمل الآن"
+                                captain?.isOnline == true && shiftStatus is ShiftStatus.Active && gpsStatus is GpsStatus.Active -> "يعمل الآن"
+                                captain?.isOnline == true && shiftStatus is ShiftStatus.Active -> "جاهز - GPS غير مفعل"
                                 shiftStatus is ShiftStatus.Active -> "ابدأ العمل"
                                 isReadyWindow -> "جاهز"
                                 else -> "غير متصل"
