@@ -4,6 +4,9 @@ import android.content.Context
 import android.location.Location
 import android.net.Uri
 import android.util.Log
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Locale
 import com.example.data.location.GpsConfig
 import com.google.firebase.Timestamp
 import com.google.firebase.auth.FirebaseAuth
@@ -2725,13 +2728,38 @@ class CaptainRepository(
     private var lastUploadedPresence: String? = null
 
     /** Fail-closed local guard; server independently validates workStatus, schedule and GPS freshness. */
+    private fun buildShiftInstanceKey(shift: ShiftEntity): String {
+        val calendar = ShiftManager.getCurrentCairoCalendar()
+        if (shift.dayOfWeek != calendar.get(Calendar.DAY_OF_WEEK)) {
+            calendar.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        val dayKey = when (shift.dayOfWeek) {
+            Calendar.SATURDAY -> "saturday"
+            Calendar.SUNDAY -> "sunday"
+            Calendar.MONDAY -> "monday"
+            Calendar.TUESDAY -> "tuesday"
+            Calendar.WEDNESDAY -> "wednesday"
+            Calendar.THURSDAY -> "thursday"
+            Calendar.FRIDAY -> "friday"
+            else -> "unknown"
+        }
+        val dateKey = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
+            timeZone = ShiftManager.CAIRO_TIME_ZONE
+        }.format(calendar.time)
+        val startMinutes = ShiftManager.parseTimeToMinutes(shift.startTime)
+        return "$dateKey|$dayKey|${startMinutes.toString().padStart(4, '0')}"
+    }
+
     suspend fun hasConfirmedShiftReadiness(): Boolean {
         val user = firebaseAuth.currentUser ?: return false
         if (!user.isEmailVerified) return false
+        val active = ShiftManager.calculateShiftStatus(getShifts()) as? ShiftStatus.Active ?: return false
+        val expectedShiftKey = buildShiftInstanceKey(active.shift)
         val snap = firestore.collection("captains").document(user.uid).get(Source.SERVER).await()
         return snap.exists() &&
             snap.getString("workStatus") == "ready" &&
-            snap.getBoolean("readyConfirmed") == true
+            snap.getBoolean("readyConfirmed") == true &&
+            snap.getString("readyShiftKey") == expectedShiftKey
     }
 
     suspend fun isEligibleForLocationTracking(): Boolean {
@@ -2740,20 +2768,17 @@ class CaptainRepository(
         if (!user.isEmailVerified) return false
         val captain = captainDao.getCaptain() ?: return false
         if (!captain.isOnline) return false
-        if (ShiftManager.calculateShiftStatus(getShifts()) !is ShiftStatus.Active) return false
+        val active = ShiftManager.calculateShiftStatus(getShifts()) as? ShiftStatus.Active ?: return false
+        val expectedShiftKey = buildShiftInstanceKey(active.shift)
 
-        // Ask the server to validate this exact shift instance. The callable is idempotent
-        // for an already-working captain and rejects stale Ready/Working state from another day.
-        return runCatching {
-            FirebaseFunctions.getInstance()
-                .getHttpsCallable("updateCaptainShiftPresence")
-                .call(mapOf("action" to "working"))
-                .await()
-            true
-        }.getOrElse { error ->
-            Log.w("CaptainRepository", "Server rejected GPS eligibility for current shift: ${error.message}")
-            false
-        }
+        // One server read per five-minute GPS callback; never trust a stale local online flag.
+        val serverCaptain = firestore.collection("captains").document(user.uid).get(Source.SERVER).await()
+        return serverCaptain.exists() &&
+            serverCaptain.getBoolean("isOnline") == true &&
+            serverCaptain.getString("workStatus") == "working" &&
+            serverCaptain.getBoolean("readyConfirmed") == true &&
+            serverCaptain.getString("readyShiftKey") == expectedShiftKey &&
+            serverCaptain.getString("workingShiftKey") == expectedShiftKey
     }
 
     suspend fun updateCaptainGpsLocation(location: Location): Boolean {
