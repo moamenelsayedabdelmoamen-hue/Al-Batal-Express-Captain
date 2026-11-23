@@ -2742,13 +2742,18 @@ class CaptainRepository(
         if (!captain.isOnline) return false
         if (ShiftManager.calculateShiftStatus(getShifts()) !is ShiftStatus.Active) return false
 
-        // One server read per five-minute GPS callback protects against stale local Room state,
-        // manual Firestore edits, or a previous app version leaving the captain marked online.
-        val serverCaptain = firestore.collection("captains").document(user.uid).get(Source.SERVER).await()
-        return serverCaptain.exists() &&
-            serverCaptain.getBoolean("isOnline") == true &&
-            serverCaptain.getString("workStatus") == "working" &&
-            serverCaptain.getBoolean("readyConfirmed") == true
+        // Ask the server to validate this exact shift instance. The callable is idempotent
+        // for an already-working captain and rejects stale Ready/Working state from another day.
+        return runCatching {
+            FirebaseFunctions.getInstance()
+                .getHttpsCallable("updateCaptainShiftPresence")
+                .call(mapOf("action" to "working"))
+                .await()
+            true
+        }.getOrElse { error ->
+            Log.w("CaptainRepository", "Server rejected GPS eligibility for current shift: ${error.message}")
+            false
+        }
     }
 
     suspend fun updateCaptainGpsLocation(location: Location): Boolean {
