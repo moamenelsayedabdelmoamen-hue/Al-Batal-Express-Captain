@@ -479,6 +479,9 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                         )
                         val wasReady = captainState.value?.isOnline == true &&
                             repository.hasConfirmedShiftReadiness()
+                        val alreadyWorking = !wasReady &&
+                            captainState.value?.isOnline == true &&
+                            repository.isEligibleForLocationTracking()
                         if (wasReady) {
                             repository.setOnlineStatus(true)
                             if (CaptainLocationTracker.hasLocationPermission(appContext) &&
@@ -489,11 +492,25 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                             } else {
                                 _eventFlow.emit(UiEvent.ShowToast("بدأ الشفت لكن يلزم تفعيل إذن الموقع وGPS لبدء استقبال الطلبات."))
                             }
+                        } else if (alreadyWorking) {
+                            // Re-open a previously working session without asking the captain to confirm again.
+                            if (!CaptainLocationTracker.isTracking.value &&
+                                CaptainLocationTracker.hasLocationPermission(appContext) &&
+                                CaptainLocationTracker.isGpsProviderEnabled(appContext)
+                            ) {
+                                CaptainLocationTracker.startService(appContext)
+                            }
+                        } else if (captainState.value?.isOnline == true) {
+                            // A stale online flag is never treated as proof of readiness.
+                            repository.setOnlineStatus(false)
                         }
                         _eventFlow.emit(
                             UiEvent.ShowToast(
-                                if (wasReady) "بدأ شفتك. تم تحويل حالتك إلى يعمل الآن."
-                                else "بدأ شفتك. اضغط زر جاهز/بدء العمل لتأكيد حضورك."
+                                when {
+                                    wasReady -> "بدأ شفتك. تم تحويل حالتك إلى يعمل الآن."
+                                    alreadyWorking -> "تم استعادة جلسة عملك الحالية."
+                                    else -> "بدأ شفتك. لم يتم تسجيل تأكيد جاهزية لهذا الشفت."
+                                }
                             )
                         )
                     } else if (prev is ShiftStatus.Active && latestShiftStatus !is ShiftStatus.Active) {
