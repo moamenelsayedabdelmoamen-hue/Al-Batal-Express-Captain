@@ -140,6 +140,11 @@ fun DashboardScreen(
             readinessStatusText = "الحساب بانتظار الاعتماد من الإدارة"
             readinessColor = HeroYellow
         }
+        captain?.isOnline == true && shiftStatus is ShiftStatus.UpcomingSoon &&
+            shiftStatus.millisUntilStart in 1L..(30L * 60_000L) -> {
+            readinessStatusText = "جاهز لبدء الشفت"
+            readinessColor = HeroYellow
+        }
         captain?.isOnline != true -> {
             readinessStatusText = "غير متصل"
             readinessColor = Color.Gray
@@ -223,20 +228,35 @@ fun DashboardScreen(
 
                     // Online/Offline Switch
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        val canConfirmShiftReadiness =
+                            captain?.isOnline == true ||
+                                shiftStatus is ShiftStatus.Active ||
+                                (shiftStatus is ShiftStatus.UpcomingSoon &&
+                                    shiftStatus.millisUntilStart in 1L..(30L * 60_000L))
+                        val isReadyWindow = shiftStatus is ShiftStatus.UpcomingSoon &&
+                            shiftStatus.millisUntilStart in 1L..(30L * 60_000L)
                         Switch(
                             checked = captain?.isOnline == true,
+                            enabled = canConfirmShiftReadiness,
                             onCheckedChange = { onToggleOnline() },
                             colors = SwitchDefaults.colors(
                                 checkedThumbColor = Color.White,
-                                checkedTrackColor = StatusOnlineGreen,
+                                checkedTrackColor = if (isReadyWindow || (shiftStatus is ShiftStatus.Active && gpsStatus !is GpsStatus.Active)) HeroYellow else StatusOnlineGreen,
                                 uncheckedThumbColor = Color.LightGray,
                                 uncheckedTrackColor = DarkSurfaceVariant
                             )
                         )
                         Text(
-                            text = if (captain?.isOnline == true) "متصل" else "غير متصل",
+                            text = when {
+                                captain?.isOnline == true && isReadyWindow -> "جاهز"
+                                captain?.isOnline == true && shiftStatus is ShiftStatus.Active && gpsStatus is GpsStatus.Active -> "يعمل الآن"
+                                captain?.isOnline == true && shiftStatus is ShiftStatus.Active -> "جاهز - GPS غير مفعل"
+                                shiftStatus is ShiftStatus.Active -> "ابدأ العمل"
+                                isReadyWindow -> "جاهز"
+                                else -> "غير متصل"
+                            },
                             style = MaterialTheme.typography.labelSmall,
-                            color = Color.LightGray
+                            color = if (isReadyWindow && captain?.isOnline == true) HeroYellow else Color.LightGray
                         )
                     }
                 }

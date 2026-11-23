@@ -85,7 +85,12 @@ class CaptainLocationService : Service() {
         // Sync to Firestore via repository
         serviceScope.launch {
             try {
-                repository?.updateCaptainGpsLocation(location)
+                val eligible = repository?.updateCaptainGpsLocation(location) == true
+                if (!eligible) {
+                    Log.i(TAG, "Shift ended or captain is no longer working; stopping GPS and order listeners")
+                    stopLocationTracking()
+                    return@launch
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "Error syncing location from service to Firestore", e)
             }
@@ -96,6 +101,18 @@ class CaptainLocationService : Service() {
     }
 
     private fun startLocationTracking() {
+        serviceScope.launch {
+            val eligible = runCatching { repository?.isEligibleForLocationTracking() == true }.getOrDefault(false)
+            if (!eligible) {
+                Log.w(TAG, "GPS start denied: captain is not confirmed working inside the active shift")
+                stopLocationTracking()
+                return@launch
+            }
+            startLocationTrackingAuthorized()
+        }
+    }
+
+    private fun startLocationTrackingAuthorized() {
         if (!CaptainLocationTracker.hasLocationPermission(this)) {
             Log.w(TAG, "Location permission missing, stopping service")
             CaptainLocationTracker.updateStatus(GpsStatus.PermissionDenied)

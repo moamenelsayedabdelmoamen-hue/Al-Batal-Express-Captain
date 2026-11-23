@@ -20,16 +20,19 @@ data class ScheduledShiftTrigger(
     val dayNameArabic: String,
     val startFormatted: String,
     val endFormatted: String,
-    val dedupeKey: String
+    val dedupeKey: String,
+    val isReadyWindow: Boolean = false
 )
 
 object ShiftNotificationScheduler {
     private const val TAG = "ShiftNotifScheduler"
     private const val REQUEST_CODE_START_BASE = 10_000
     private const val REQUEST_CODE_END_BASE = 20_000
+    private const val REQUEST_CODE_READY_BASE = 30_000
 
     const val ACTION_SHIFT_START_ALERT = "com.example.action.SHIFT_START_ALERT"
     const val ACTION_SHIFT_END_ALERT = "com.example.action.SHIFT_END_ALERT"
+    const val ACTION_SHIFT_READY_ALERT = "com.example.action.SHIFT_READY_ALERT"
 
     const val EXTRA_CAPTAIN_UID = "extra_captain_uid"
     const val EXTRA_DAY_OF_WEEK = "extra_day_of_week"
@@ -105,6 +108,23 @@ object ShiftNotificationScheduler {
                 )
             )
 
+            // Alert once 30 minutes before the shift, even if the app is closed.
+            val readyTriggerMs = startTriggerMs - 30L * 60_000L
+            if (readyTriggerMs > nowMs) {
+                triggers.add(
+                    ScheduledShiftTrigger(
+                        dayOfWeek = shift.dayOfWeek,
+                        isStart = true,
+                        triggerAtMillis = readyTriggerMs,
+                        dayNameArabic = dayNameArabic,
+                        startFormatted = startFormatted,
+                        endFormatted = endFormatted,
+                        dedupeKey = "${dateFmt.format(Date(startTriggerMs))}_${shift.dayOfWeek}_ready",
+                        isReadyWindow = true
+                    )
+                )
+            }
+
             val isOvernight = endMin < startMin
             val endDayOfWeek = if (isOvernight) {
                 if (shift.dayOfWeek == Calendar.SATURDAY) Calendar.SUNDAY else shift.dayOfWeek + 1
@@ -171,7 +191,8 @@ object ShiftNotificationScheduler {
         for (day in Calendar.SUNDAY..Calendar.SATURDAY) {
             listOf(
                 ACTION_SHIFT_START_ALERT to (REQUEST_CODE_START_BASE + day),
-                ACTION_SHIFT_END_ALERT to (REQUEST_CODE_END_BASE + day)
+                ACTION_SHIFT_END_ALERT to (REQUEST_CODE_END_BASE + day),
+                ACTION_SHIFT_READY_ALERT to (REQUEST_CODE_READY_BASE + day)
             ).forEach { (action, reqCode) ->
                 val intent = Intent(context, ShiftAlarmReceiver::class.java).apply {
                     this.action = action
@@ -195,8 +216,16 @@ object ShiftNotificationScheduler {
         captainUid: String,
         trigger: ScheduledShiftTrigger
     ): PendingIntent {
-        val action = if (trigger.isStart) ACTION_SHIFT_START_ALERT else ACTION_SHIFT_END_ALERT
-        val requestCode = (if (trigger.isStart) REQUEST_CODE_START_BASE else REQUEST_CODE_END_BASE) + trigger.dayOfWeek
+        val action = when {
+            trigger.isReadyWindow -> ACTION_SHIFT_READY_ALERT
+            trigger.isStart -> ACTION_SHIFT_START_ALERT
+            else -> ACTION_SHIFT_END_ALERT
+        }
+        val requestCode = when {
+            trigger.isReadyWindow -> REQUEST_CODE_READY_BASE + trigger.dayOfWeek
+            trigger.isStart -> REQUEST_CODE_START_BASE + trigger.dayOfWeek
+            else -> REQUEST_CODE_END_BASE + trigger.dayOfWeek
+        }
 
         val intent = Intent(context, ShiftAlarmReceiver::class.java).apply {
             this.action = action

@@ -368,6 +368,47 @@ object CaptainNotificationManager {
     }
 
     @SuppressLint("MissingPermission")
+    fun showShiftReadyWindowNotification(
+        context: Context,
+        dayNameArabic: String,
+        startFormatted: String,
+        endFormatted: String,
+        dedupeKey: String
+    ): Boolean {
+        ensureNotificationChannels(context)
+        if (!hasNotificationPermission(context)) return false
+        if (!markIfNotNotified(context, "shift_ready_$dedupeKey", 20L * 3600_000L)) return false
+        val launchIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            putExtra(EXTRA_NAVIGATE_TARGET, TARGET_DASHBOARD)
+        }
+        val notifId = 58_000 + (kotlin.math.abs(dedupeKey.hashCode()) % 5_000)
+        val pendingIntent = PendingIntent.getActivity(
+            context, notifId, launchIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val body = "شفتك سيبدأ خلال 30 دقيقة ($dayNameArabic) من $startFormatted إلى $endFormatted. افتح التطبيق واضغط «جاهز» لتأكيد حضورك."
+        val notification = NotificationCompat.Builder(context, CHANNEL_SHIFT_ALERTS_ID)
+            .setSmallIcon(resolveNotificationIcon())
+            .setContentTitle("شفتك سيبدأ خلال 30 دقيقة")
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_REMINDER)
+            .setDefaults(NotificationCompat.DEFAULT_ALL)
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .build()
+        return try {
+            NotificationManagerCompat.from(context).notify(notifId, notification)
+            true
+        } catch (e: SecurityException) {
+            Log.w(TAG, "SecurityException posting shift-ready notification: ${e.message}")
+            false
+        }
+    }
+
+    @SuppressLint("MissingPermission")
     fun showShiftStartNotification(
         context: Context,
         dayNameArabic: String,
