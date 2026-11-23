@@ -450,7 +450,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                 if (currentShiftsList.isNotEmpty() && captainState.value?.isLoggedIn == true) {
                     val prev = previousLoadedShiftStatus
                     val dedupeKey = when (latestShiftStatus) {
-                        is ShiftStatus.UpcomingSoon -> ShiftNotificationScheduler.buildTodayDedupeKey(latestShiftStatus.shift, isStart = true) + "_ready"
+                        is ShiftStatus.UpcomingSoon -> ShiftNotificationScheduler.buildTodayDedupeKey(latestShiftStatus.shift, isStart = true).removeSuffix("_start") + "_ready"
                         is ShiftStatus.Active -> ShiftNotificationScheduler.buildTodayDedupeKey(latestShiftStatus.shift, isStart = true)
                         else -> ""
                     }
