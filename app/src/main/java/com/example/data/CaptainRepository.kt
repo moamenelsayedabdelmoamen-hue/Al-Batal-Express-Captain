@@ -2724,13 +2724,30 @@ class CaptainRepository(
     private var lastUploadedPresence: String? = null
 
     /** Fail-closed local guard; server independently validates workStatus, schedule and GPS freshness. */
+    suspend fun hasConfirmedShiftReadiness(): Boolean {
+        val user = firebaseAuth.currentUser ?: return false
+        if (!user.isEmailVerified) return false
+        val snap = firestore.collection("captains").document(user.uid).get(Source.SERVER).await()
+        return snap.exists() &&
+            snap.getString("workStatus") == "ready" &&
+            snap.getBoolean("readyConfirmed") == true
+    }
+
     suspend fun isEligibleForLocationTracking(): Boolean {
         if (_accountApprovalState.value != null && !isCurrentSessionApproved) return false
         val user = firebaseAuth.currentUser ?: return false
         if (!user.isEmailVerified) return false
         val captain = captainDao.getCaptain() ?: return false
         if (!captain.isOnline) return false
-        return ShiftManager.calculateShiftStatus(getShifts()) is ShiftStatus.Active
+        if (ShiftManager.calculateShiftStatus(getShifts()) !is ShiftStatus.Active) return false
+
+        // One server read per five-minute GPS callback protects against stale local Room state,
+        // manual Firestore edits, or a previous app version leaving the captain marked online.
+        val serverCaptain = firestore.collection("captains").document(user.uid).get(Source.SERVER).await()
+        return serverCaptain.exists() &&
+            serverCaptain.getBoolean("isOnline") == true &&
+            serverCaptain.getString("workStatus") == "working" &&
+            serverCaptain.getBoolean("readyConfirmed") == true
     }
 
     suspend fun updateCaptainGpsLocation(location: Location) {
