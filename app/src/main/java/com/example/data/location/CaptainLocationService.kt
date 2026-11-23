@@ -85,13 +85,12 @@ class CaptainLocationService : Service() {
         // Sync to Firestore via repository
         serviceScope.launch {
             try {
-                val eligible = repository?.isEligibleForLocationTracking() == true
+                val eligible = repository?.updateCaptainGpsLocation(location) == true
                 if (!eligible) {
                     Log.i(TAG, "Shift ended or captain is no longer working; stopping GPS and order listeners")
                     stopLocationTracking()
                     return@launch
                 }
-                repository?.updateCaptainGpsLocation(location)
             } catch (e: Exception) {
                 Log.e(TAG, "Error syncing location from service to Firestore", e)
             }
