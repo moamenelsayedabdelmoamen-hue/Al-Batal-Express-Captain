@@ -236,6 +236,9 @@ fun AppNavigation(
     }
 
     LaunchedEffect(Unit) {
+        // Start network-backed Auth + admin approval validation immediately, in parallel
+        // with the branded intro animation.
+        viewModel.prepareStartupSessionCheck()
         viewModel.eventFlow.collect { event ->
             when (event) {
                 is UiEvent.ShowToast -> {
@@ -264,6 +267,8 @@ fun AppNavigation(
             SplashScreen(
                 isLoggedIn = captain?.isLoggedIn == true,
                 playbackMode = splashPlaybackMode,
+                // Keep the branded intro, but never let video decoding delay app entry for long.
+                safetyTimeoutMs = 1_200L,
                 onNavigateNext = {
                     viewModel.onIntroSplashFinished()
                 }
