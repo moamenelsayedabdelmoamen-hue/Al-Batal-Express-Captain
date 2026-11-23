@@ -14,6 +14,7 @@ import com.google.firebase.auth.UserProfileChangeRequest
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.functions.FirebaseFunctions
 import com.google.firebase.firestore.FirebaseFirestoreException
 import com.google.firebase.firestore.GeoPoint
 import com.google.firebase.firestore.ListenerRegistration
@@ -2770,8 +2771,6 @@ class CaptainRepository(
             "bearing" to location.bearing.toDouble(),
             "speed" to location.speed.toDouble(),
             "isOnline" to true,
-            "workStatus" to "working",
-            "readyConfirmed" to true,
             "presenceStatus" to presenceValue,
             "availabilityStatus" to presenceValue,
             "lastLocationUpdate" to FieldValue.serverTimestamp(),
@@ -2795,28 +2794,26 @@ class CaptainRepository(
         val user = firebaseAuth.currentUser ?: return
         val uid = user.uid
         if (uid.isBlank()) return
-
-        val offlineData = mapOf<String, Any>(
-            "isOnline" to false,
-            "workStatus" to "off_shift",
-            "readyConfirmed" to false,
-            "presenceStatus" to "offline",
-            "availabilityStatus" to "offline",
-            "updatedAt" to FieldValue.serverTimestamp()
-        )
-        try {
-            withContext(NonCancellable + Dispatchers.IO) {
-                try {
-                    firestore.collection("captains").document(uid).update(offlineData).await()
-                } catch (e: Exception) {
-                    if (e is CancellationException) throw e
-                    Log.w("CaptainRepository", "Updating captain offline doc notice: ${e.message}")
+        withContext(NonCancellable + Dispatchers.IO) {
+            try {
+                FirebaseFunctions.getInstance()
+                    .getHttpsCallable("updateCaptainShiftPresence")
+                    .call(mapOf("action" to "offline"))
+                    .await()
+            } catch (e: Exception) {
+                // Firestore rules allow only the fail-closed offline presence fallback from the client.
+                runCatching {
+                    firestore.collection("captains").document(uid).update(
+                        mapOf(
+                            "isOnline" to false,
+                            "presenceStatus" to "offline",
+                            "availabilityStatus" to "offline",
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
+                    ).await()
                 }
+                Log.w("CaptainRepository", "Server offline transition fallback used: ${e.message}")
             }
-        } catch (_: CancellationException) {
-            // Coroutine cancelled cleanly, ignore
-        } catch (e: Exception) {
-            Log.w("CaptainRepository", "Notice updating offline status in Firestore: ${e.message}")
         }
     }
 
@@ -2826,35 +2823,52 @@ class CaptainRepository(
     }
 
     suspend fun setOnlineStatus(isOnline: Boolean) {
-        if (isOnline && (_accountApprovalState.value != null && !isCurrentSessionApproved)) {
+        if (isOnline) {
+            if (_accountApprovalState.value != null && !isCurrentSessionApproved) {
+                captainDao.updateOnlineStatus(false)
+                return
+            }
+            if (ShiftManager.calculateShiftStatus(getShifts()) !is ShiftStatus.Active) {
+                captainDao.updateOnlineStatus(false)
+                return
+            }
+            try {
+                FirebaseFunctions.getInstance()
+                    .getHttpsCallable("updateCaptainShiftPresence")
+                    .call(mapOf("action" to "working"))
+                    .await()
+                captainDao.updateOnlineStatus(true)
+            } catch (e: Exception) {
+                captainDao.updateOnlineStatus(false)
+                Log.e("CaptainRepository", "Server rejected working-state transition", e)
+                return
+            }
+        } else {
             captainDao.updateOnlineStatus(false)
-            return
-        }
-        if (isOnline && ShiftManager.calculateShiftStatus(getShifts()) !is ShiftStatus.Active) {
-            captainDao.updateOnlineStatus(false)
-            return
-        }
-        captainDao.updateOnlineStatus(isOnline)
-        if (!isOnline) {
             orderDao.deleteAllPendingOrders()
             context?.let { CaptainNotificationManager.stopIncomingOrderBell(it) }
-        }
-        val uid = runCatching { authBackend.currentUser()?.uid }.getOrNull()?.takeIf { it.isNotBlank() }
-            ?: runCatching { cloudMetadataPort.currentAuthUid() }.getOrNull()?.takeIf { it.isNotBlank() }
-        if (!uid.isNullOrBlank()) {
-            val statusValue = if (isOnline) "working" else "offline"
-            val statusMap = mapOf<String, Any>(
-                "isOnline" to isOnline,
-                "workStatus" to if (isOnline) "working" else "off_shift",
-                "readyConfirmed" to isOnline,
-                "presenceStatus" to statusValue,
-                "availabilityStatus" to statusValue,
-                "updatedAt" to FieldValue.serverTimestamp()
-            )
-            try {
-                firestore.collection("captains").document(uid).update(statusMap).await()
-            } catch (e: Exception) {
-                Log.e("CaptainRepository", "Error updating online status in Firestore", e)
+            val uid = runCatching { authBackend.currentUser()?.uid }.getOrNull()?.takeIf { it.isNotBlank() }
+                ?: runCatching { cloudMetadataPort.currentAuthUid() }.getOrNull()?.takeIf { it.isNotBlank() }
+            if (!uid.isNullOrBlank()) {
+                try {
+                    FirebaseFunctions.getInstance()
+                        .getHttpsCallable("updateCaptainShiftPresence")
+                        .call(mapOf("action" to "offline"))
+                        .await()
+                } catch (e: Exception) {
+                    // Fail closed locally even if the callable is temporarily unreachable.
+                    runCatching {
+                        firestore.collection("captains").document(uid).update(
+                            mapOf(
+                                "isOnline" to false,
+                                "presenceStatus" to "offline",
+                                "availabilityStatus" to "offline",
+                                "updatedAt" to FieldValue.serverTimestamp()
+                            )
+                        ).await()
+                    }
+                    Log.w("CaptainRepository", "Server offline transition fallback used: ${e.message}")
+                }
             }
         }
     }
@@ -2865,28 +2879,27 @@ class CaptainRepository(
         val status = ShiftManager.calculateShiftStatus(getShifts())
         val inReadyWindow = status is ShiftStatus.UpcomingSoon &&
             status.millisUntilStart in 1L..(30L * 60_000L)
-        if (ready && !inReadyWindow) return
-        captainDao.updateOnlineStatus(ready)
-        if (!ready) {
-            orderDao.deleteAllPendingOrders()
-            context?.let { CaptainNotificationManager.stopIncomingOrderBell(it) }
-        }
+        val activeNow = status is ShiftStatus.Active
+        if (ready && !inReadyWindow && !activeNow) return
+
         val uid = runCatching { authBackend.currentUser()?.uid }.getOrNull()?.takeIf { it.isNotBlank() }
             ?: runCatching { cloudMetadataPort.currentAuthUid() }.getOrNull()?.takeIf { it.isNotBlank() }
             ?: return
-        val state = if (ready) "ready" else "off_shift"
-        val presence = if (ready) "ready" else "offline"
-        firestore.collection("captains").document(uid).update(
-            mapOf(
-                "isOnline" to ready,
-                "workStatus" to state,
-                "readyConfirmed" to ready,
-                "presenceStatus" to presence,
-                "availabilityStatus" to presence,
-                "readyConfirmedAt" to if (ready) FieldValue.serverTimestamp() else FieldValue.delete(),
-                "updatedAt" to FieldValue.serverTimestamp()
-            )
-        ).await()
+        try {
+            FirebaseFunctions.getInstance()
+                .getHttpsCallable("updateCaptainShiftPresence")
+                .call(mapOf("action" to if (ready) "ready" else "offline"))
+                .await()
+            captainDao.updateOnlineStatus(ready)
+            if (!ready) {
+                orderDao.deleteAllPendingOrders()
+                context?.let { CaptainNotificationManager.stopIncomingOrderBell(it) }
+            }
+        } catch (e: Exception) {
+            if (ready) captainDao.updateOnlineStatus(false)
+            Log.e("CaptainRepository", "Unable to update server-confirmed captain readiness", e)
+            throw e
+        }
     }
 
     suspend fun logout() {
