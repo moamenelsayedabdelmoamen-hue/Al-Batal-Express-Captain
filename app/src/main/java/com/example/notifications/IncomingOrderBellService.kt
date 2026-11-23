@@ -274,8 +274,6 @@ class IncomingOrderBellService : Service() {
         countdownJob?.cancel()
         countdownJob = serviceScope.launch {
             val db = runCatching { AppDatabase.getDatabase(applicationContext) }.getOrNull()
-            val notifManager = getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager
-
             // Observe Room changes instead of querying the captain and order tables every second.
             // The notification's native countdown chronometer updates itself without repeated notify() calls.
             if (db != null) {
