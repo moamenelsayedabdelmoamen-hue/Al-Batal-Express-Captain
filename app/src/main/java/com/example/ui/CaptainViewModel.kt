@@ -48,6 +48,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 sealed class UiEvent {
     data class ShowToast(val message: String) : UiEvent()
@@ -406,6 +407,10 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
     internal var startupSessionResolverOverride: (suspend () -> StartupSessionState)? = null
     // Startup auth/approval validation runs while the branded intro is visible.
     // The operational session remains gated until BOTH checks have completed.
+    private companion object {
+        const val STARTUP_SESSION_CHECK_TIMEOUT_MS = 8_000L
+    }
+
     private var startupSessionCheckStarted = false
     private var startupSessionCheckFinished = false
     private var introVisualFinished = false
@@ -1309,11 +1314,29 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         startupSessionCheckStarted = true
         viewModelScope.launch {
             val sessionState = try {
-                startupSessionResolverOverride?.invoke()
-                    ?: repository.resolveStartupSessionState()
+                withTimeoutOrNull(STARTUP_SESSION_CHECK_TIMEOUT_MS) {
+                    startupSessionResolverOverride?.invoke()
+                        ?: repository.resolveStartupSessionState()
+                } ?: run {
+                    Log.w(
+                        "CaptainViewModel",
+                        "Startup session check timed out after ${STARTUP_SESSION_CHECK_TIMEOUT_MS}ms; keeping access closed."
+                    )
+                    StartupSessionState.ApprovalCheckFailed(
+                        CaptainAccountApprovalResolver.networkFailure(
+                            message = "استغرق التحقق من الحساب وقتاً أطول من المعتاد. تحقق من اتصال الإنترنت ثم أعد المحاولة."
+                        )
+                    )
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
             } catch (e: Exception) {
-                Log.w("CaptainViewModel", "Startup session check fallback to Login: ${e.message}")
-                null
+                Log.w("CaptainViewModel", "Startup session check failed; keeping access closed: ${e.message}", e)
+                StartupSessionState.ApprovalCheckFailed(
+                    CaptainAccountApprovalResolver.networkFailure(
+                        message = "تعذر التحقق من حالة الحساب. تحقق من اتصال الإنترنت ثم أعد المحاولة."
+                    )
+                )
             }
             resolvedStartupSession = sessionState
             startupSessionCheckFinished = true
