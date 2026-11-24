@@ -2865,11 +2865,11 @@ class CaptainRepository(
         if (isOnline) {
             if (_accountApprovalState.value != null && !isCurrentSessionApproved) {
                 captainDao.updateOnlineStatus(false)
-                return
+                throw IllegalStateException("حساب الكابتن غير معتمد حالياً من الإدارة.")
             }
             if (ShiftManager.calculateShiftStatus(getShifts()) !is ShiftStatus.Active) {
                 captainDao.updateOnlineStatus(false)
-                return
+                throw IllegalStateException("لا يمكن بدء العمل خارج وقت الشفت المحدد.")
             }
             try {
                 FirebaseFunctions.getInstance()
@@ -2880,7 +2880,7 @@ class CaptainRepository(
             } catch (e: Exception) {
                 captainDao.updateOnlineStatus(false)
                 Log.e("CaptainRepository", "Server rejected working-state transition", e)
-                return
+                throw e
             }
         } else {
             captainDao.updateOnlineStatus(false)
@@ -2914,16 +2914,20 @@ class CaptainRepository(
 
     /** Records the captain's explicit confirmation during the 30-minute pre-shift window. */
     suspend fun setCaptainReadyStatus(ready: Boolean) {
-        if (ready && (_accountApprovalState.value != null && !isCurrentSessionApproved)) return
+        if (ready && (_accountApprovalState.value != null && !isCurrentSessionApproved)) {
+            throw IllegalStateException("حساب الكابتن غير معتمد حالياً من الإدارة.")
+        }
         val status = ShiftManager.calculateShiftStatus(getShifts())
         val inReadyWindow = status is ShiftStatus.UpcomingSoon &&
             status.millisUntilStart in 1L..(30L * 60_000L)
         val activeNow = status is ShiftStatus.Active
-        if (ready && !inReadyWindow && !activeNow) return
+        if (ready && !inReadyWindow && !activeNow) {
+            throw IllegalStateException("تأكيد الجاهزية متاح قبل الشفت بـ30 دقيقة أو أثناء الشفت فقط.")
+        }
 
         val uid = runCatching { authBackend.currentUser()?.uid }.getOrNull()?.takeIf { it.isNotBlank() }
             ?: runCatching { cloudMetadataPort.currentAuthUid() }.getOrNull()?.takeIf { it.isNotBlank() }
-            ?: return
+            ?: throw IllegalStateException("انتهت جلسة تسجيل الدخول. سجّل الدخول مرة أخرى.")
         try {
             FirebaseFunctions.getInstance()
                 .getHttpsCallable("updateCaptainShiftPresence")
