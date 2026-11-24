@@ -18,6 +18,7 @@ class CaptainFirebaseMessagingService : FirebaseMessagingService() {
     override fun onNewToken(token: String) {
         super.onNewToken(token)
         Log.i(TAG, "Refreshed FCM token received")
+        com.example.data.CaptainRepository.fcmTokenHardFailureDetected = false
         CaptainNotificationManager.saveFcmToken(applicationContext, token)
 
         val uid = runCatching { FirebaseAuth.getInstance().currentUser?.uid }.getOrNull()

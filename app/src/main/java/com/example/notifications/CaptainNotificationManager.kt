@@ -464,6 +464,61 @@ object CaptainNotificationManager {
     }
 
     @SuppressLint("MissingPermission")
+    fun showShiftStartOpenAppForGpsNotification(
+        context: Context,
+        dayNameArabic: String,
+        startFormatted: String,
+        endFormatted: String,
+        dedupeKey: String,
+        bypassDedupe: Boolean = false
+    ): Boolean {
+        ensureNotificationChannels(context)
+        if (!hasNotificationPermission(context)) {
+            Log.w(TAG, "Skipping shift-start GPS prompt notification: POST_NOTIFICATIONS permission not granted")
+            return false
+        }
+
+        if (!bypassDedupe && !markIfNotNotified(context, "shift_gps_open_$dedupeKey", 20L * 3600_000L)) {
+            return false
+        }
+
+        val launchIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            putExtra(EXTRA_NAVIGATE_TARGET, TARGET_DASHBOARD)
+        }
+        val notifId = 54_000 + (kotlin.math.abs(dedupeKey.hashCode()) % 2_000)
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            notifId,
+            launchIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val safeDay = dayNameArabic.ifBlank { "اليوم" }
+        val body = "بدأ شفت عملك ($safeDay) من $startFormatted إلى $endFormatted. اضغط لفتح التطبيق وتفعيل تتبع الموقع GPS واستقبال الطلبات."
+
+        val notification = NotificationCompat.Builder(context, CHANNEL_SHIFT_ALERTS_ID)
+            .setSmallIcon(resolveNotificationIcon())
+            .setContentTitle("افتح التطبيق لتفعيل GPS للشفت")
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_REMINDER)
+            .setDefaults(NotificationCompat.DEFAULT_ALL)
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .build()
+
+        return try {
+            NotificationManagerCompat.from(context).notify(notifId, notification)
+            true
+        } catch (e: SecurityException) {
+            Log.w(TAG, "SecurityException posting shift-start GPS prompt notification: ${e.message}")
+            false
+        }
+    }
+
+    @SuppressLint("MissingPermission")
     fun showShiftEndNotification(
         context: Context,
         dayNameArabic: String,

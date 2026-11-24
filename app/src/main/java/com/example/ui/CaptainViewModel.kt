@@ -13,6 +13,7 @@ import com.example.data.CaptainEntity
 import com.example.data.CaptainRepository
 import com.example.data.DailyWalletEntity
 import com.example.data.DailyWalletManager
+import com.example.data.LocationEligibilityResult
 import com.example.data.LoginOutcome
 import com.example.data.OrderEntity
 import com.example.data.OrderHistoryHelper
@@ -25,6 +26,7 @@ import com.example.data.ShiftStatus
 import com.example.data.StartupSessionState
 import com.example.data.location.CaptainLocationTracker
 import com.example.data.location.GpsStatus
+import com.example.data.location.LocationServiceStartResult
 import com.example.data.storage.ImageUploadState
 import com.example.ui.navigation.ScreenRoute
 import android.util.Log
@@ -34,6 +36,9 @@ import com.example.notifications.ShiftNotificationScheduler
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.ListenerRegistration
+import com.google.firebase.functions.FirebaseFunctionsException
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -405,6 +410,28 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
     private var attachedApprovalUid: String? = null
 
     internal var startupSessionResolverOverride: (suspend () -> StartupSessionState)? = null
+    internal var startupSessionCheckTimeoutMs: Long = STARTUP_SESSION_CHECK_TIMEOUT_MS
+
+    // Resilient 1-second ticker test hooks
+    internal var tickerRetryBackoffMs: Long = SHIFT_TRANSITION_RETRY_INTERVAL_MS
+    internal var tickerShiftStatusOverride: (() -> ShiftStatus)? = null
+    internal var tickerCaptainLoggedInOverride: (() -> Boolean)? = null
+    internal var tickerCaptainOnlineOverride: (() -> Boolean)? = null
+    internal var tickerShiftReadinessOverride: (suspend () -> Boolean)? = null
+    internal var tickerLocationEligibilityOverride: (suspend () -> LocationEligibilityResult)? = null
+    internal var tickerSetOnlineStatusOverride: (suspend (Boolean) -> Unit)? = null
+    internal var setCaptainReadyStatusOverride: (suspend (Boolean) -> Unit)? = null
+    internal var tickerSyncOrdersOverride: (suspend () -> Unit)? = null
+    internal var tickerSyncPendingOfflineOverride: (suspend () -> Boolean)? = null
+
+    internal class TickerLoopState(
+        var previousLoadedShiftStatus: ShiftStatus? = null,
+        var lastTransitionRetryAtMs: Long = 0L,
+        var consecutiveTickerErrors: Int = 0,
+        var tickCount: Int = 0,
+        var lastClockUiUpdateMs: Long = 0L
+    )
+
     // Startup auth/approval validation runs while the branded intro is visible.
     // The operational session remains gated until BOTH checks have completed.
     private var startupSessionCheckStarted = false
@@ -438,137 +465,17 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         ensureFirebaseInitialized()
         CaptainNotificationManager.ensureNotificationChannels(appContext)
 
-        // Check shift boundaries every second, but only publish UI state when its displayed value changes.
+        // Check shift boundaries every second, but only publish UI clock state every 15s and when displayed values change.
         viewModelScope.launch {
-            var previousLoadedShiftStatus: ShiftStatus? = null
-            var lastClockUiUpdateMs = 0L
+            val tickerState = TickerLoopState()
             while (true) {
-                val nowMs = System.currentTimeMillis()
-                if (nowMs - lastClockUiUpdateMs >= 15_000L) {
-                    val nextTime = ShiftManager.getCurrentCairoTimeFormatted()
-                    if (_currentCairoTime.value != nextTime) _currentCairoTime.value = nextTime
-                    val nextDate = ShiftManager.getCurrentCairoDateFormatted()
-                    if (_currentCairoDate.value != nextDate) _currentCairoDate.value = nextDate
-                    lastClockUiUpdateMs = nowMs
-                }
-                val currentShiftsList = shifts.value
-                val latestShiftStatus = ShiftManager.calculateShiftStatus(currentShiftsList)
-                if (_shiftStatus.value != latestShiftStatus) _shiftStatus.value = latestShiftStatus
-
-                if (currentShiftsList.isNotEmpty() && captainState.value?.isLoggedIn == true) {
-                    val prev = previousLoadedShiftStatus
-                    val dedupeKey = when (latestShiftStatus) {
-                        is ShiftStatus.UpcomingSoon -> ShiftNotificationScheduler.buildTodayDedupeKey(latestShiftStatus.shift, isStart = true).removeSuffix("_start") + "_ready"
-                        is ShiftStatus.Active -> ShiftNotificationScheduler.buildTodayDedupeKey(latestShiftStatus.shift, isStart = true)
-                        else -> ""
-                    }
-
-                    if (latestShiftStatus is ShiftStatus.UpcomingSoon &&
-                        latestShiftStatus.millisUntilStart in 1L..(30L * 60_000L) &&
-                        (prev !is ShiftStatus.UpcomingSoon || prev.shift.id != latestShiftStatus.shift.id ||
-                            prev.millisUntilStart > 30L * 60_000L)
-                    ) {
-                        CaptainNotificationManager.showShiftReadyWindowNotification(
-                            context = appContext,
-                            dayNameArabic = latestShiftStatus.shift.dayNameArabic,
-                            startFormatted = latestShiftStatus.startFormatted,
-                            endFormatted = latestShiftStatus.endFormatted,
-                            dedupeKey = dedupeKey
-                        )
-                    }
-
-                    if (prev !is ShiftStatus.Active && latestShiftStatus is ShiftStatus.Active) {
-                        CaptainNotificationManager.showShiftStartNotification(
-                            context = appContext,
-                            dayNameArabic = latestShiftStatus.shift.dayNameArabic,
-                            startFormatted = latestShiftStatus.startFormatted,
-                            endFormatted = latestShiftStatus.endFormatted,
-                            dedupeKey = ShiftNotificationScheduler.buildTodayDedupeKey(latestShiftStatus.shift, isStart = true)
-                        )
-                        val wasReady = captainState.value?.isOnline == true &&
-                            repository.hasConfirmedShiftReadiness()
-                        val alreadyWorking = !wasReady &&
-                            captainState.value?.isOnline == true &&
-                            repository.isEligibleForLocationTracking()
-                        if (wasReady) {
-                            if (!CaptainLocationTracker.hasLocationPermission(appContext)) {
-                                _eventFlow.emit(UiEvent.RequestLocationPermission)
-                            } else if (!CaptainLocationTracker.isGpsProviderEnabled(appContext)) {
-                                _eventFlow.emit(UiEvent.RequestGpsEnable)
-                            } else {
-                                repository.setOnlineStatus(true)
-                                if (repository.isEligibleForLocationTracking()) {
-                                    CaptainLocationTracker.startService(appContext)
-                                    repository.syncOrdersDetailedFromFirestore()
-                                }
-                            }
-                        } else if (alreadyWorking) {
-                            // Re-open a previously working session without asking the captain to confirm again.
-                            if (!CaptainLocationTracker.isTracking.value &&
-                                CaptainLocationTracker.hasLocationPermission(appContext) &&
-                                CaptainLocationTracker.isGpsProviderEnabled(appContext)
-                            ) {
-                                CaptainLocationTracker.startService(appContext)
-                            }
-                        } else if (captainState.value?.isOnline == true) {
-                            // A stale online flag is never treated as proof of readiness.
-                            repository.setOnlineStatus(false)
-                        }
-                        _eventFlow.emit(
-                            UiEvent.ShowToast(
-                                when {
-                                    wasReady && CaptainLocationTracker.hasLocationPermission(appContext) &&
-                                        CaptainLocationTracker.isGpsProviderEnabled(appContext) ->
-                                        "بدأ شفتك. تم تحويل حالتك إلى يعمل الآن."
-                                    wasReady -> "أنت جاهز، لكن يلزم منح إذن الموقع وتشغيل GPS قبل بدء استقبال الطلبات."
-                                    alreadyWorking -> "تم استعادة جلسة عملك الحالية."
-                                    else -> "بدأ شفتك. لم يتم تسجيل تأكيد جاهزية لهذا الشفت."
-                                }
-                            )
-                        )
-                    } else if (prev is ShiftStatus.Active && latestShiftStatus !is ShiftStatus.Active) {
-                        CaptainLocationTracker.stopService(appContext)
-                        if (captainState.value?.isOnline == true) {
-                            repository.setOnlineStatus(false)
-                        }
-                        CaptainNotificationManager.showShiftEndNotification(
-                            context = appContext,
-                            dayNameArabic = prev.shift.dayNameArabic,
-                            endFormatted = prev.endFormatted,
-                            dedupeKey = ShiftNotificationScheduler.buildTodayDedupeKey(prev.shift, isStart = false)
-                        )
-                        _eventFlow.emit(
-                            UiEvent.ShowToast("انتهى شفت العمل. تم إيقاف استقبال الطلبات وتتبع الموقع.")
-                        )
-                    }
-                    if (prev == null && captainState.value?.isOnline == true &&
-                        latestShiftStatus !is ShiftStatus.Active &&
-                        !(latestShiftStatus is ShiftStatus.UpcomingSoon &&
-                            latestShiftStatus.millisUntilStart in 1L..(30L * 60_000L))
-                    ) {
-                        // Clear stale online state left by an older app version or a missed shift end.
-                        repository.setOnlineStatus(false)
-                        CaptainLocationTracker.stopService(appContext)
-                    }
-                    previousLoadedShiftStatus = latestShiftStatus
-                }
-
-                val latestCalendarToday = OrderHistoryHelper.getTodayDateKey()
-                if (latestCalendarToday != _todayCalendarDateKey.value) {
-                    val prevToday = _todayCalendarDateKey.value
-                    _todayCalendarDateKey.value = latestCalendarToday
-                    if (_selectedHistoryDateKey.value == prevToday) {
-                        _selectedHistoryDateKey.value = latestCalendarToday
-                    }
-                }
-
-                val latestOpDay = DailyWalletManager.getOperationalDayKey()
-                if (latestOpDay != _currentOperationalDayKey.value) {
-                    _currentOperationalDayKey.value = latestOpDay
-                    repository.reconcileDailyWallets()
-                    _eventFlow.emit(
-                        UiEvent.ShowToast("الساعة 1:00 م: تم تسجيل رصيد المحفظة في اليوم السابق وبدء محفظة اليوم الجديد برصيد 0 ج.م")
-                    )
+                try {
+                    runSingleTickerCycle(tickerState)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (e: Exception) {
+                    tickerState.consecutiveTickerErrors++
+                    Log.e("CaptainViewModel", "Ticker loop caught unexpected exception (continuing): ${e.message}", e)
                 }
                 delay(1000L)
             }
@@ -727,6 +634,300 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         setupRealtimeShiftListener()
     }
 
+    internal suspend fun runSingleTickerCycle(
+        state: TickerLoopState,
+        nowMs: Long = System.currentTimeMillis()
+    ) {
+        val appContext = getApplication<Application>()
+        state.tickCount++
+
+        // Throttle Cairo clock/date StateFlow publishing to every 15 seconds while keeping 1s shift checks.
+        if (state.lastClockUiUpdateMs == 0L || nowMs - state.lastClockUiUpdateMs >= 15_000L) {
+            val nextTime = ShiftManager.getCurrentCairoTimeFormatted()
+            if (_currentCairoTime.value != nextTime) _currentCairoTime.value = nextTime
+            val nextDate = ShiftManager.getCurrentCairoDateFormatted()
+            if (_currentCairoDate.value != nextDate) _currentCairoDate.value = nextDate
+            state.lastClockUiUpdateMs = nowMs
+        }
+
+        val currentShiftsList = if (_hasLiveShiftSnapshot.value) _liveShifts.value else shifts.value
+        val latestShiftStatus = tickerShiftStatusOverride?.invoke()
+            ?: ShiftManager.calculateShiftStatus(currentShiftsList)
+        if (_shiftStatus.value != latestShiftStatus) _shiftStatus.value = latestShiftStatus
+
+        // Retry any deferred server-side offline sync once connectivity returns.
+        try {
+            if (tickerSyncPendingOfflineOverride != null) {
+                tickerSyncPendingOfflineOverride!!.invoke()
+            } else {
+                repository.syncPendingOfflineStatusIfNeeded()
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (e: Exception) {
+            Log.w("CaptainViewModel", "Deferred offline sync retry notice: ${e.message}")
+        }
+
+        val hasShiftsLoaded = tickerShiftStatusOverride != null || currentShiftsList.isNotEmpty()
+        val isLoggedIn = tickerCaptainLoggedInOverride?.invoke() ?: (captainState.value?.isLoggedIn == true)
+        val isOnlineNow: () -> Boolean = { tickerCaptainOnlineOverride?.invoke() ?: (captainState.value?.isOnline == true) }
+
+        if (hasShiftsLoaded && isLoggedIn) {
+            val prev = state.previousLoadedShiftStatus
+            val dedupeKey = when (latestShiftStatus) {
+                is ShiftStatus.UpcomingSoon -> ShiftNotificationScheduler.buildTodayDedupeKey(latestShiftStatus.shift, isStart = true).removeSuffix("_start") + "_ready"
+                is ShiftStatus.Active -> ShiftNotificationScheduler.buildTodayDedupeKey(latestShiftStatus.shift, isStart = true)
+                else -> ""
+            }
+
+            if (latestShiftStatus is ShiftStatus.UpcomingSoon &&
+                latestShiftStatus.millisUntilStart in 1L..(30L * 60_000L) &&
+                (prev !is ShiftStatus.UpcomingSoon || prev.shift.id != latestShiftStatus.shift.id ||
+                    prev.millisUntilStart > 30L * 60_000L)
+            ) {
+                CaptainNotificationManager.showShiftReadyWindowNotification(
+                    context = appContext,
+                    dayNameArabic = latestShiftStatus.shift.dayNameArabic,
+                    startFormatted = latestShiftStatus.startFormatted,
+                    endFormatted = latestShiftStatus.endFormatted,
+                    dedupeKey = dedupeKey
+                )
+            }
+
+            var advancePreviousStatus = true
+
+            if (prev !is ShiftStatus.Active && latestShiftStatus is ShiftStatus.Active) {
+                val backoffActive = state.lastTransitionRetryAtMs > 0L &&
+                    (nowMs - state.lastTransitionRetryAtMs) < tickerRetryBackoffMs
+                if (backoffActive) {
+                    advancePreviousStatus = false
+                } else {
+                    CaptainNotificationManager.showShiftStartNotification(
+                        context = appContext,
+                        dayNameArabic = latestShiftStatus.shift.dayNameArabic,
+                        startFormatted = latestShiftStatus.startFormatted,
+                        endFormatted = latestShiftStatus.endFormatted,
+                        dedupeKey = ShiftNotificationScheduler.buildTodayDedupeKey(latestShiftStatus.shift, isStart = true)
+                    )
+                    var shiftStartDeferredDueToNetwork = false
+                    val captainCurrentlyOnline = isOnlineNow()
+
+                    val wasReady = if (captainCurrentlyOnline) {
+                        try {
+                            tickerShiftReadinessOverride?.invoke() ?: repository.hasConfirmedShiftReadiness()
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (e: Exception) {
+                            state.consecutiveTickerErrors++
+                            state.lastTransitionRetryAtMs = nowMs
+                            shiftStartDeferredDueToNetwork = true
+                            Log.w("CaptainViewModel", "Network error checking shift readiness at shift start; will retry: ${e.message}")
+                            false
+                        }
+                    } else {
+                        false
+                    }
+
+                    val alreadyWorking = if (!shiftStartDeferredDueToNetwork && !wasReady && captainCurrentlyOnline) {
+                        val eligibility = try {
+                            tickerLocationEligibilityOverride?.invoke() ?: repository.checkLocationTrackingEligibility()
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (e: Exception) {
+                            LocationEligibilityResult.NetworkError(e)
+                        }
+                        when (eligibility) {
+                            is LocationEligibilityResult.Eligible -> true
+                            is LocationEligibilityResult.NetworkError -> {
+                                state.consecutiveTickerErrors++
+                                state.lastTransitionRetryAtMs = nowMs
+                                shiftStartDeferredDueToNetwork = true
+                                Log.w("CaptainViewModel", "Network error checking working state at shift start; will retry: ${eligibility.cause.message}")
+                                false
+                            }
+                            is LocationEligibilityResult.Ineligible -> false
+                        }
+                    } else {
+                        false
+                    }
+
+                    if (!shiftStartDeferredDueToNetwork) {
+                        if (wasReady) {
+                            if (!CaptainLocationTracker.hasLocationPermission(appContext)) {
+                                _eventFlow.emit(UiEvent.RequestLocationPermission)
+                            } else if (!CaptainLocationTracker.isGpsProviderEnabled(appContext)) {
+                                _eventFlow.emit(UiEvent.RequestGpsEnable)
+                            } else {
+                                val promoteSucceeded = try {
+                                    if (tickerSetOnlineStatusOverride != null) {
+                                        tickerSetOnlineStatusOverride!!.invoke(true)
+                                    } else {
+                                        repository.setOnlineStatus(true)
+                                    }
+                                    true
+                                } catch (cancelled: CancellationException) {
+                                    throw cancelled
+                                } catch (e: Exception) {
+                                    state.consecutiveTickerErrors++
+                                    state.lastTransitionRetryAtMs = nowMs
+                                    shiftStartDeferredDueToNetwork = true
+                                    Log.w("CaptainViewModel", "Error promoting captain to working at shift start; will retry: ${e.message}")
+                                    false
+                                }
+
+                                if (promoteSucceeded) {
+                                    val postPromoteEligibility = try {
+                                        tickerLocationEligibilityOverride?.invoke()
+                                            ?: repository.checkLocationTrackingEligibility()
+                                    } catch (cancelled: CancellationException) {
+                                        throw cancelled
+                                    } catch (e: Exception) {
+                                        LocationEligibilityResult.NetworkError(e)
+                                    }
+                                    when (postPromoteEligibility) {
+                                        is LocationEligibilityResult.Eligible -> {
+                                            CaptainLocationTracker.startServiceSafely(appContext)
+                                            try {
+                                                if (tickerSyncOrdersOverride != null) {
+                                                    tickerSyncOrdersOverride!!.invoke()
+                                                } else {
+                                                    repository.syncOrdersDetailedFromFirestore()
+                                                }
+                                            } catch (cancelled: CancellationException) {
+                                                throw cancelled
+                                            } catch (e: Exception) {
+                                                Log.w("CaptainViewModel", "Order sync after shift start failed: ${e.message}")
+                                            }
+                                        }
+                                        is LocationEligibilityResult.NetworkError -> {
+                                            state.consecutiveTickerErrors++
+                                            state.lastTransitionRetryAtMs = nowMs
+                                            shiftStartDeferredDueToNetwork = true
+                                        }
+                                        is LocationEligibilityResult.Ineligible -> Unit
+                                    }
+                                }
+                            }
+                        } else if (alreadyWorking) {
+                            // Re-open a previously working session without asking the captain to confirm again.
+                            if (!CaptainLocationTracker.isTracking.value &&
+                                CaptainLocationTracker.hasLocationPermission(appContext) &&
+                                CaptainLocationTracker.isGpsProviderEnabled(appContext)
+                            ) {
+                                CaptainLocationTracker.startServiceSafely(appContext)
+                            }
+                        } else if (captainCurrentlyOnline) {
+                            // A stale online flag is never treated as proof of readiness.
+                            try {
+                                if (tickerSetOnlineStatusOverride != null) {
+                                    tickerSetOnlineStatusOverride!!.invoke(false)
+                                } else {
+                                    repository.setOnlineStatus(false)
+                                }
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (e: Exception) {
+                                Log.w("CaptainViewModel", "Error clearing stale online status at shift start: ${e.message}")
+                            }
+                        }
+                    }
+
+                    if (shiftStartDeferredDueToNetwork) {
+                        advancePreviousStatus = false
+                    } else {
+                        state.consecutiveTickerErrors = 0
+                        state.lastTransitionRetryAtMs = 0L
+                        _eventFlow.emit(
+                            UiEvent.ShowToast(
+                                when {
+                                    wasReady && CaptainLocationTracker.hasLocationPermission(appContext) &&
+                                        CaptainLocationTracker.isGpsProviderEnabled(appContext) ->
+                                        "بدأ شفتك. تم تحويل حالتك إلى يعمل الآن."
+                                    wasReady -> "أنت جاهز، لكن يلزم منح إذن الموقع وتشغيل GPS قبل بدء استقبال الطلبات."
+                                    alreadyWorking -> "تم استعادة جلسة عملك الحالية."
+                                    else -> "بدأ شفتك. لم يتم تسجيل تأكيد جاهزية لهذا الشفت."
+                                }
+                            )
+                        )
+                    }
+                }
+            } else if (prev is ShiftStatus.Active && latestShiftStatus !is ShiftStatus.Active) {
+                CaptainLocationTracker.stopService(appContext)
+                if (isOnlineNow()) {
+                    try {
+                        if (tickerSetOnlineStatusOverride != null) {
+                            tickerSetOnlineStatusOverride!!.invoke(false)
+                        } else {
+                            repository.setOnlineStatus(false)
+                        }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (e: Exception) {
+                        state.consecutiveTickerErrors++
+                        Log.w("CaptainViewModel", "Shift-end offline server sync failed (deferred for retry): ${e.message}")
+                    }
+                }
+                CaptainNotificationManager.showShiftEndNotification(
+                    context = appContext,
+                    dayNameArabic = prev.shift.dayNameArabic,
+                    endFormatted = prev.endFormatted,
+                    dedupeKey = ShiftNotificationScheduler.buildTodayDedupeKey(prev.shift, isStart = false)
+                )
+                _eventFlow.emit(
+                    UiEvent.ShowToast("انتهى شفت العمل. تم إيقاف استقبال الطلبات وتتبع الموقع.")
+                )
+            }
+
+            if (prev == null && isOnlineNow() &&
+                latestShiftStatus !is ShiftStatus.Active &&
+                !(latestShiftStatus is ShiftStatus.UpcomingSoon &&
+                    latestShiftStatus.millisUntilStart in 1L..(30L * 60_000L))
+            ) {
+                // Clear stale online state left by an older app version or a missed shift end.
+                CaptainLocationTracker.stopService(appContext)
+                try {
+                    if (tickerSetOnlineStatusOverride != null) {
+                        tickerSetOnlineStatusOverride!!.invoke(false)
+                    } else {
+                        repository.setOnlineStatus(false)
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (e: Exception) {
+                    Log.w("CaptainViewModel", "Error clearing stale outside-shift online state: ${e.message}")
+                }
+            }
+
+            if (advancePreviousStatus) {
+                state.previousLoadedShiftStatus = latestShiftStatus
+            }
+        }
+
+        val latestCalendarToday = OrderHistoryHelper.getTodayDateKey()
+        if (latestCalendarToday != _todayCalendarDateKey.value) {
+            val prevToday = _todayCalendarDateKey.value
+            _todayCalendarDateKey.value = latestCalendarToday
+            if (_selectedHistoryDateKey.value == prevToday) {
+                _selectedHistoryDateKey.value = latestCalendarToday
+            }
+        }
+
+        val latestOpDay = DailyWalletManager.getOperationalDayKey()
+        if (latestOpDay != _currentOperationalDayKey.value) {
+            _currentOperationalDayKey.value = latestOpDay
+            try {
+                repository.reconcileDailyWallets()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                Log.w("CaptainViewModel", "Daily wallet rollover reconcile notice: ${e.message}")
+            }
+            _eventFlow.emit(
+                UiEvent.ShowToast("الساعة 1:00 م: تم تسجيل رصيد المحفظة في اليوم السابق وبدء محفظة اليوم الجديد برصيد 0 ج.م")
+            )
+        }
+    }
+
     private fun resumeLocationTrackingIfNeeded() {
         val app = getApplication<Application>()
         if (CaptainLocationTracker.isTracking.value) return
@@ -741,12 +942,19 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                 _eventFlow.emit(UiEvent.RequestGpsEnable)
                 return@launch
             }
-            if (!repository.isEligibleForLocationTracking()) {
-                CaptainLocationTracker.stopService(app)
-                return@launch
+            when (val eligibility = repository.checkLocationTrackingEligibility()) {
+                is LocationEligibilityResult.Eligible -> {
+                    CaptainLocationTracker.startServiceSafely(app)
+                }
+                is LocationEligibilityResult.Ineligible -> {
+                    Log.i("CaptainViewModel", "Skipping location service resume (confirmed ineligible: ${eligibility.reason})")
+                    CaptainLocationTracker.stopService(app)
+                }
+                is LocationEligibilityResult.NetworkError -> {
+                    // Never stop/offline captain on transient network errors; keep state intact for retry.
+                    Log.w("CaptainViewModel", "Could not verify GPS resume eligibility due to network error: ${eligibility.cause.message}")
+                }
             }
-            runCatching { CaptainLocationTracker.startService(app) }
-                .onFailure { Log.w("CaptainViewModel", "Could not resume location service: ${it.message}") }
         }
     }
 
@@ -856,42 +1064,194 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    @Volatile
+    private var isUpdatingOnlineStatus: Boolean = false
+
+    @Volatile
+    private var pendingStartWorkAfterGpsEnable: Boolean = false
+
+    private fun mapPresenceErrorToArabicMessage(error: Throwable, fallback: String): String {
+        if (error is TimeoutCancellationException) {
+            return "انتهت مهلة الاتصال بالخادم. تحقق من اتصال الإنترنت وحاول مرة أخرى."
+        }
+        if (error is FirebaseFunctionsException) {
+            return when (error.code) {
+                FirebaseFunctionsException.Code.UNAUTHENTICATED ->
+                    "انتهت صلاحية الجلسة. يرجى إعادة تسجيل الدخول ثم المحاولة مرة أخرى."
+                FirebaseFunctionsException.Code.PERMISSION_DENIED ->
+                    "لا تملك صلاحية تفعيل العمل حالياً. تأكد من اعتماد حسابك من الإدارة."
+                FirebaseFunctionsException.Code.FAILED_PRECONDITION ->
+                    error.message?.takeIf { it.isNotBlank() && it.any { ch -> ch in '\u0600'..'\u06FF' } }
+                        ?: "تعذر تفعيل العمل حالياً. تأكد من أنك داخل وقت الشفت المعتمد وحاول مرة أخرى."
+                FirebaseFunctionsException.Code.UNAVAILABLE,
+                FirebaseFunctionsException.Code.DEADLINE_EXCEEDED ->
+                    "تعذر الوصول إلى الخادم حالياً. تحقق من اتصال الإنترنت وحاول مرة أخرى."
+                FirebaseFunctionsException.Code.NOT_FOUND ->
+                    "خدمة تفعيل الشفت غير متاحة مؤقتاً على الخادم. يرجى المحاولة لاحقاً."
+                else -> fallback
+            }
+        }
+        return fallback
+    }
+
+    private suspend fun activateShiftWorkSafely(
+        app: Application,
+        callReadyFirst: Boolean,
+        successToast: String,
+        ineligibleToast: String
+    ) {
+        try {
+            if (callReadyFirst) {
+                try {
+                    setCaptainReadyStatusOverride?.invoke(true) ?: repository.setCaptainReadyStatus(true)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (e: FirebaseFunctionsException) {
+                    // If server indicates captain is already ready/working inside the active shift,
+                    // proceed directly to the working transition instead of aborting.
+                    if (e.code == FirebaseFunctionsException.Code.FAILED_PRECONDITION) {
+                        Log.w("CaptainViewModel", "Pre-ready returned FAILED_PRECONDITION inside active shift; continuing to working transition: ${e.message}")
+                    } else {
+                        throw e
+                    }
+                }
+            }
+            tickerSetOnlineStatusOverride?.invoke(true) ?: repository.setOnlineStatus(true)
+            when (val eligibility = tickerLocationEligibilityOverride?.invoke() ?: repository.checkLocationTrackingEligibility()) {
+                is LocationEligibilityResult.Eligible -> {
+                    val startResult = CaptainLocationTracker.startServiceSafely(app)
+                    runCatching { repository.startRealtimeOrdersListener() }
+                    if (tickerSyncOrdersOverride != null) {
+                        try {
+                            tickerSyncOrdersOverride?.invoke()
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (e: Exception) {
+                            Log.w("CaptainViewModel", "Order sync override after starting work failed: ${e.message}")
+                        }
+                    } else if (auth?.currentUser?.isEmailVerified == true) {
+                        try {
+                            repository.syncOrdersDetailedFromFirestore()
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (e: Exception) {
+                            Log.w("CaptainViewModel", "Order sync after starting work failed: ${e.message}")
+                        }
+                    }
+                    when (startResult) {
+                        is LocationServiceStartResult.Started -> {
+                            _eventFlow.emit(UiEvent.ShowToast(successToast))
+                        }
+                        is LocationServiceStartResult.BlockedByBackgroundRestriction -> {
+                            _eventFlow.emit(
+                                UiEvent.ShowToast("تم تفعيل وضع متصل، يرجى إبقاء التطبيق مفتوحاً في الواجهة لتشغيل تتبع الموقع.")
+                            )
+                        }
+                        is LocationServiceStartResult.Failed -> {
+                            _eventFlow.emit(
+                                UiEvent.ShowToast("تم تفعيل وضع متصل، لكن تعذر تشغيل خدمة الموقع حالياً. أعد المحاولة.")
+                            )
+                        }
+                    }
+                }
+                is LocationEligibilityResult.NetworkError -> {
+                    Log.w("CaptainViewModel", "Network error verifying work eligibility: ${eligibility.cause.message}")
+                    _eventFlow.emit(
+                        UiEvent.ShowToast("تعذر التحقق من حالة الشفت مع الخادم. تحقق من اتصال الإنترنت وحاول مرة أخرى.")
+                    )
+                }
+                is LocationEligibilityResult.Ineligible -> {
+                    Log.w("CaptainViewModel", "Captain ineligible to start GPS tracking: ${eligibility.reason}")
+                    _eventFlow.emit(UiEvent.ShowToast(ineligibleToast))
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (e: Exception) {
+            Log.e("CaptainViewModel", "Failed to start shift work", e)
+            _eventFlow.emit(
+                UiEvent.ShowToast(
+                    mapPresenceErrorToArabicMessage(
+                        error = e,
+                        fallback = "تعذر بدء العمل حالياً. تحقق من اتصال الإنترنت وحاول مرة أخرى."
+                    )
+                )
+            )
+        }
+    }
+
     fun toggleOnlineStatus() {
         val app = getApplication<Application>()
         val currentlyOnline = captainState.value?.isOnline == true
         val status = _shiftStatus.value
 
         if (currentlyOnline) {
+            if (isUpdatingOnlineStatus) return
             viewModelScope.launch {
-                val readyButNotWorking = status is ShiftStatus.Active &&
-                    repository.hasConfirmedShiftReadiness() &&
-                    !repository.isEligibleForLocationTracking()
-                if (readyButNotWorking) {
-                    if (!CaptainLocationTracker.hasLocationPermission(app)) {
-                        _eventFlow.emit(UiEvent.RequestLocationPermission)
-                        return@launch
+                isUpdatingOnlineStatus = true
+                try {
+                    if (status is ShiftStatus.Active) {
+                        if (!CaptainLocationTracker.hasLocationPermission(app)) {
+                            _eventFlow.emit(UiEvent.RequestLocationPermission)
+                            return@launch
+                        }
+                        if (!CaptainLocationTracker.isGpsProviderEnabled(app)) {
+                            pendingStartWorkAfterGpsEnable = true
+                            _eventFlow.emit(UiEvent.RequestGpsEnable)
+                            _eventFlow.emit(UiEvent.ShowToast("يرجى تشغيل الموقع (GPS) لبدء العمل واستقبال الطلبات."))
+                            return@launch
+                        }
+                        val readyButNotWorking = try {
+                            repository.hasConfirmedShiftReadiness() &&
+                                !repository.isEligibleForLocationTracking()
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (e: Exception) {
+                            Log.w("CaptainViewModel", "Error checking readiness while toggling online status: ${e.message}")
+                            false
+                        }
+                        if (readyButNotWorking || !CaptainLocationTracker.isTracking.value) {
+                            activateShiftWorkSafely(
+                                app = app,
+                                callReadyFirst = false,
+                                successToast = "أنت الآن متصل وتم فتح الموقع (GPS) لاستقبال الطلبات.",
+                                ineligibleToast = "تعذر تفعيل العمل وGPS حالياً. تأكد من تأكيد الجاهزية وحاول مرة أخرى."
+                            )
+                            return@launch
+                        }
                     }
-                    if (!CaptainLocationTracker.isGpsProviderEnabled(app)) {
-                        _eventFlow.emit(UiEvent.RequestGpsEnable)
-                        return@launch
-                    }
-                    repository.setOnlineStatus(true)
-                    if (repository.isEligibleForLocationTracking()) {
-                        CaptainLocationTracker.startService(app)
-                        repository.syncOrdersDetailedFromFirestore()
-                        _eventFlow.emit(UiEvent.ShowToast("تم تفعيل العمل وGPS لهذا الشفت."))
-                    }
-                    return@launch
-                }
 
-                CaptainNotificationManager.stopIncomingOrderBell(app)
-                CaptainLocationTracker.stopService(app)
-                if (status is ShiftStatus.UpcomingSoon) {
-                    repository.setCaptainReadyStatus(false)
-                    _eventFlow.emit(UiEvent.ShowToast("تم إلغاء تأكيد الجاهزية لهذا الشفت."))
-                } else {
-                    repository.setOnlineStatus(false)
-                    _eventFlow.emit(UiEvent.ShowToast("أنت الآن غير متصل. تم إيقاف استقبال الطلبات وتتبع الموقع."))
+                    pendingStartWorkAfterGpsEnable = false
+                    CaptainNotificationManager.stopIncomingOrderBell(app)
+                    CaptainLocationTracker.stopService(app)
+                    if (status is ShiftStatus.UpcomingSoon) {
+                        try {
+                            repository.setCaptainReadyStatus(false)
+                            _eventFlow.emit(UiEvent.ShowToast("تم إلغاء تأكيد الجاهزية لهذا الشفت."))
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (e: Exception) {
+                            Log.w("CaptainViewModel", "Error cancelling shift readiness remotely; kept local offline", e)
+                            _eventFlow.emit(UiEvent.ShowToast("تم إلغاء الجاهزية محلياً. سيتم مزامنة الحالة عند عودة الاتصال."))
+                        }
+                    } else {
+                        try {
+                            repository.setOnlineStatus(false)
+                            _eventFlow.emit(UiEvent.ShowToast("أنت الآن غير متصل. تم إيقاف استقبال الطلبات وتتبع الموقع."))
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (e: Exception) {
+                            Log.w("CaptainViewModel", "Error updating offline status", e)
+                            _eventFlow.emit(UiEvent.ShowToast("تم تحويلك إلى غير متصل محلياً. سيتم المزامنة مع الخادم لاحقاً."))
+                        }
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (e: Exception) {
+                    Log.e("CaptainViewModel", "Unexpected error toggling online status", e)
+                    _eventFlow.emit(UiEvent.ShowToast("حدث خطأ أثناء تحديث حالة الاتصال. حاول مرة أخرى."))
+                } finally {
+                    isUpdatingOnlineStatus = false
                 }
             }
             return
@@ -912,14 +1272,27 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                     }
                     return
                 }
+                if (isUpdatingOnlineStatus) return
                 viewModelScope.launch {
-                    runCatching { repository.setCaptainReadyStatus(true) }
-                        .onSuccess {
-                            _eventFlow.emit(UiEvent.ShowToast("تم تسجيلك جاهزاً. سيتم تفعيل العمل وGPS تلقائياً عند بداية الشفت."))
-                        }
-                        .onFailure {
-                            _eventFlow.emit(UiEvent.ShowToast("تعذر تسجيل الجاهزية. تحقق من اتصال الإنترنت وحاول مرة أخرى."))
-                        }
+                    isUpdatingOnlineStatus = true
+                    try {
+                        repository.setCaptainReadyStatus(true)
+                        _eventFlow.emit(UiEvent.ShowToast("تم تسجيلك جاهزاً. سيتم تفعيل العمل وGPS تلقائياً عند بداية الشفت."))
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (e: Exception) {
+                        Log.e("CaptainViewModel", "Failed to confirm pre-shift readiness", e)
+                        _eventFlow.emit(
+                            UiEvent.ShowToast(
+                                mapPresenceErrorToArabicMessage(
+                                    error = e,
+                                    fallback = "تعذر تسجيل الجاهزية. تحقق من اتصال الإنترنت وحاول مرة أخرى."
+                                )
+                            )
+                        )
+                    } finally {
+                        isUpdatingOnlineStatus = false
+                    }
                 }
             }
             is ShiftStatus.Active -> {
@@ -928,21 +1301,26 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                     return
                 }
                 if (!CaptainLocationTracker.isGpsProviderEnabled(app)) {
+                    pendingStartWorkAfterGpsEnable = true
                     viewModelScope.launch {
                         _eventFlow.emit(UiEvent.RequestGpsEnable)
-                        _eventFlow.emit(UiEvent.ShowToast("يرجى تشغيل GPS لبدء العمل واستقبال الطلبات."))
+                        _eventFlow.emit(UiEvent.ShowToast("يرجى تشغيل الموقع (GPS) لبدء العمل واستقبال الطلبات."))
                     }
                     return
                 }
+                pendingStartWorkAfterGpsEnable = false
+                if (isUpdatingOnlineStatus) return
                 viewModelScope.launch {
-                    repository.setCaptainReadyStatus(true)
-                    repository.setOnlineStatus(true)
-                    if (repository.isEligibleForLocationTracking()) {
-                        CaptainLocationTracker.startService(app)
-                        if (auth?.currentUser?.isEmailVerified == true) {
-                            repository.syncOrdersDetailedFromFirestore()
-                        }
-                        _eventFlow.emit(UiEvent.ShowToast("أنت الآن تعمل داخل الشفت ويمكنك استقبال الطلبات."))
+                    isUpdatingOnlineStatus = true
+                    try {
+                        activateShiftWorkSafely(
+                            app = app,
+                            callReadyFirst = true,
+                            successToast = "أنت الآن متصل وتم فتح الموقع (GPS) لاستقبال الطلبات.",
+                            ineligibleToast = "تعذر بدء العمل حالياً. تأكد من اعتماد حسابك ووجود شفت نشط ثم أعد المحاولة."
+                        )
+                    } finally {
+                        isUpdatingOnlineStatus = false
                     }
                 }
             }
@@ -955,27 +1333,30 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
     fun onLocationPermissionGranted() {
         val app = getApplication<Application>()
         if (!CaptainLocationTracker.isGpsProviderEnabled(app)) {
+            pendingStartWorkAfterGpsEnable = true
             viewModelScope.launch {
                 _eventFlow.emit(UiEvent.RequestGpsEnable)
-                _eventFlow.emit(UiEvent.ShowToast("تم منح الإذن. يرجى تشغيل GPS لبدء العمل."))
+                _eventFlow.emit(UiEvent.ShowToast("تم منح الإذن. يرجى تشغيل الموقع (GPS) لبدء العمل."))
             }
             return
         }
+        pendingStartWorkAfterGpsEnable = false
+        if (isUpdatingOnlineStatus) return
         viewModelScope.launch {
-            if (_shiftStatus.value !is ShiftStatus.Active) {
-                _eventFlow.emit(UiEvent.ShowToast("تم منح إذن الموقع. لن يبدأ التتبع قبل بداية الشفت وتأكيد الجاهزية."))
-                return@launch
-            }
-            repository.setCaptainReadyStatus(true)
-            repository.setOnlineStatus(true)
-            if (repository.isEligibleForLocationTracking()) {
-                CaptainLocationTracker.startService(app)
-                if (auth?.currentUser?.isEmailVerified == true) {
-                    repository.syncOrdersDetailedFromFirestore()
+            isUpdatingOnlineStatus = true
+            try {
+                if (_shiftStatus.value !is ShiftStatus.Active) {
+                    _eventFlow.emit(UiEvent.ShowToast("تم منح إذن الموقع. لن يبدأ التتبع قبل بداية الشفت وتأكيد الجاهزية."))
+                    return@launch
                 }
-                _eventFlow.emit(UiEvent.ShowToast("بدأ العمل وتم تفعيل GPS بنجاح."))
-            } else {
-                _eventFlow.emit(UiEvent.ShowToast("لا يمكن تشغيل GPS قبل تأكيد الجاهزية وداخل الشفت."))
+                activateShiftWorkSafely(
+                    app = app,
+                    callReadyFirst = true,
+                    successToast = "أنت الآن متصل وتم فتح الموقع (GPS) لاستقبال الطلبات.",
+                    ineligibleToast = "لا يمكن تشغيل GPS قبل تأكيد الجاهزية وداخل الشفت."
+                )
+            } finally {
+                isUpdatingOnlineStatus = false
             }
         }
     }
@@ -1234,7 +1615,30 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
      * block, rejection, or approval is enforced immediately without waiting for relogin.
      */
     fun onAppForegrounded() {
+        val app = getApplication<Application>()
         val route = _currentRoute.value
+        if (route == ScreenRoute.Main.route && pendingStartWorkAfterGpsEnable) {
+            pendingStartWorkAfterGpsEnable = false
+            if (_shiftStatus.value is ShiftStatus.Active &&
+                CaptainLocationTracker.hasLocationPermission(app) &&
+                CaptainLocationTracker.isGpsProviderEnabled(app) &&
+                !isUpdatingOnlineStatus
+            ) {
+                viewModelScope.launch {
+                    isUpdatingOnlineStatus = true
+                    try {
+                        activateShiftWorkSafely(
+                            app = app,
+                            callReadyFirst = captainState.value?.isOnline != true,
+                            successToast = "أنت الآن متصل وتم فتح الموقع (GPS) لاستقبال الطلبات.",
+                            ineligibleToast = "تعذر بدء العمل حالياً. تأكد من اعتماد حسابك ووجود شفت نشط ثم أعد المحاولة."
+                        )
+                    } finally {
+                        isUpdatingOnlineStatus = false
+                    }
+                }
+            }
+        }
         if (route != ScreenRoute.Main.route && route != ScreenRoute.AccountApproval.route) {
             return
         }
@@ -1315,31 +1719,32 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
     fun prepareStartupSessionCheck() {
         if (startupSessionCheckStarted || startupSessionCheckFinished) return
         startupSessionCheckStarted = true
+        val timeoutMs = startupSessionCheckTimeoutMs
         viewModelScope.launch {
             val sessionState = try {
-                withTimeoutOrNull(STARTUP_SESSION_CHECK_TIMEOUT_MS) {
+                withTimeoutOrNull(timeoutMs) {
                     startupSessionResolverOverride?.invoke()
                         ?: repository.resolveStartupSessionState()
                 } ?: run {
                     Log.w(
                         "CaptainViewModel",
-                        "Startup session check timed out after ${STARTUP_SESSION_CHECK_TIMEOUT_MS}ms; keeping access closed."
+                        "Startup session check timed out after ${timeoutMs}ms; keeping access closed."
                     )
-                    StartupSessionState.ApprovalCheckFailed(
-                        CaptainAccountApprovalResolver.networkFailure(
-                            message = "استغرق التحقق من الحساب وقتاً أطول من المعتاد. تحقق من اتصال الإنترنت ثم أعد المحاولة."
-                        )
+                    val timeoutSnapshot = CaptainAccountApprovalResolver.networkFailure(
+                        message = "استغرق التحقق من الحساب وقتاً أطول من المعتاد. تحقق من اتصال الإنترنت ثم أعد المحاولة."
                     )
+                    repository.setAccountApprovalSnapshot(timeoutSnapshot)
+                    StartupSessionState.ApprovalCheckFailed(timeoutSnapshot)
                 }
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (e: Exception) {
                 Log.w("CaptainViewModel", "Startup session check failed; keeping access closed: ${e.message}", e)
-                StartupSessionState.ApprovalCheckFailed(
-                    CaptainAccountApprovalResolver.networkFailure(
-                        message = "تعذر التحقق من حالة الحساب. تحقق من اتصال الإنترنت ثم أعد المحاولة."
-                    )
+                val errorSnapshot = CaptainAccountApprovalResolver.networkFailure(
+                    message = "تعذر التحقق من حالة الحساب. تحقق من اتصال الإنترنت ثم أعد المحاولة."
                 )
+                repository.setAccountApprovalSnapshot(errorSnapshot)
+                StartupSessionState.ApprovalCheckFailed(errorSnapshot)
             }
             resolvedStartupSession = sessionState
             startupSessionCheckFinished = true
@@ -1377,12 +1782,14 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                 _currentRoute.value = ScreenRoute.VerifyEmail.route
             }
             is StartupSessionState.AwaitingApproval -> {
+                repository.setAccountApprovalSnapshot(sessionState.approval)
                 attachCaptainApprovalListenerForCurrentUser()
                 detachShiftSnapshotListeners()
                 CaptainLocationTracker.stopService(getApplication())
                 _currentRoute.value = ScreenRoute.AccountApproval.route
             }
             is StartupSessionState.ApprovalCheckFailed -> {
+                repository.setAccountApprovalSnapshot(sessionState.approval)
                 detachShiftSnapshotListeners()
                 CaptainLocationTracker.stopService(getApplication())
                 _approvalFeedback.value = sessionState.approval.networkError
@@ -2053,6 +2460,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
 
     companion object {
         const val STARTUP_SESSION_CHECK_TIMEOUT_MS = 25_000L
+        const val SHIFT_TRANSITION_RETRY_INTERVAL_MS = 5_000L
         private val BLOCKED_ACCOUNT_STATUSES = setOf("banned", "suspended", "disabled", "blocked")
         private val INACTIVE_ACCOUNT_STATUSES = BLOCKED_ACCOUNT_STATUSES + setOf("pending", "inactive")
 

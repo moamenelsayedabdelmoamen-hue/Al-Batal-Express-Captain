@@ -219,7 +219,7 @@ fun AppNavigation(
         }
     }
 
-    val requestLocationPermissionsAction = {
+    val requestLocationPermissionsAction: () -> Unit = {
         val perms = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             arrayOf(
                 Manifest.permission.ACCESS_FINE_LOCATION,
@@ -232,7 +232,15 @@ fun AppNavigation(
                 Manifest.permission.ACCESS_COARSE_LOCATION
             )
         }
-        locationPermissionLauncher.launch(perms)
+        runCatching {
+            locationPermissionLauncher.launch(perms)
+        }.onFailure {
+            Toast.makeText(
+                context,
+                "تعذر فتح نافذة إذن الموقع. يرجى تفعيل الإذن من إعدادات التطبيق.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -254,8 +262,20 @@ fun AppNavigation(
                     requestLocationPermissionsAction()
                 }
                 UiEvent.RequestGpsEnable -> {
-                    val intent = Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)
-                    context.startActivity(intent)
+                    runCatching {
+                        val intent = Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS).apply {
+                            if (context !is android.app.Activity) {
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                        }
+                        context.startActivity(intent)
+                    }.onFailure {
+                        Toast.makeText(
+                            context,
+                            "يرجى تفعيل خدمة الموقع (GPS) يدوياً من إعدادات الهاتف.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
                 }
             }
         }

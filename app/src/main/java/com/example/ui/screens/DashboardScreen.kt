@@ -241,6 +241,7 @@ fun DashboardScreen(
                             checked = captain?.isOnline == true,
                             enabled = canConfirmShiftReadiness,
                             onCheckedChange = { onToggleOnline() },
+                            modifier = Modifier.testTag("online_status_switch"),
                             colors = SwitchDefaults.colors(
                                 checkedThumbColor = Color.White,
                                 checkedTrackColor = if (isReadyWindow || (shiftStatus is ShiftStatus.Active && gpsStatus !is GpsStatus.Active)) HeroYellow else StatusOnlineGreen,
@@ -251,14 +252,20 @@ fun DashboardScreen(
                         Text(
                             text = when {
                                 captain?.isOnline == true && isReadyWindow -> "جاهز"
-                                captain?.isOnline == true && shiftStatus is ShiftStatus.Active && gpsStatus is GpsStatus.Active -> "يعمل الآن"
-                                captain?.isOnline == true && shiftStatus is ShiftStatus.Active -> "جاهز - GPS غير مفعل"
-                                shiftStatus is ShiftStatus.Active -> "ابدأ العمل"
+                                captain?.isOnline == true && shiftStatus is ShiftStatus.Active && gpsStatus is GpsStatus.Active -> "متصل"
+                                captain?.isOnline == true && shiftStatus is ShiftStatus.Active -> "متصل - فعّل الموقع"
+                                shiftStatus is ShiftStatus.Active -> "متصل"
                                 isReadyWindow -> "جاهز"
                                 else -> "غير متصل"
                             },
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (isReadyWindow && captain?.isOnline == true) HeroYellow else Color.LightGray
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontWeight = if (shiftStatus is ShiftStatus.Active) FontWeight.Bold else FontWeight.Normal
+                            ),
+                            color = when {
+                                captain?.isOnline == true && shiftStatus is ShiftStatus.Active && gpsStatus is GpsStatus.Active -> StatusOnlineGreen
+                                (isReadyWindow && captain?.isOnline == true) || shiftStatus is ShiftStatus.Active -> HeroYellow
+                                else -> Color.LightGray
+                            }
                         )
                     }
                 }
@@ -644,7 +651,11 @@ fun DashboardScreen(
                         )
                         Spacer(modifier = Modifier.height(6.dp))
                         Text(
-                            text = "لا يتم إسناد أو عرض أي طلبات جديدة لك أثناء وضع (غير متصل). فعّل زر الاتصال في أعلى الشاشة لتصبح متاحاً لاستقبال الرحلات.",
+                            text = if (shiftStatus is ShiftStatus.Active) {
+                                "أنت داخل وقت الشفت الآن. اضغط على زر (متصل) لفتح الموقع (GPS) والبدء في استقبال الطلبات."
+                            } else {
+                                "لا يتم إسناد أو عرض أي طلبات جديدة لك أثناء وضع (غير متصل). فعّل زر الاتصال عند بداية الشفت لتصبح متاحاً لاستقبال الرحلات."
+                            },
                             style = MaterialTheme.typography.bodySmall,
                             color = Color.LightGray,
                             textAlign = androidx.compose.ui.text.style.TextAlign.Center
@@ -652,10 +663,11 @@ fun DashboardScreen(
                         Spacer(modifier = Modifier.height(14.dp))
                         OutlinedButton(
                             onClick = onToggleOnline,
+                            modifier = Modifier.testTag("activate_online_button"),
                             shape = RoundedCornerShape(12.dp)
                         ) {
                             Text(
-                                text = "تفعيل وضع متصل",
+                                text = if (shiftStatus is ShiftStatus.Active) "متصل" else "تفعيل وضع متصل",
                                 style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
                                 color = HeroYellow
                             )

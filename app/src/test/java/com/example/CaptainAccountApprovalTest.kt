@@ -441,6 +441,99 @@ class CaptainAccountApprovalTest {
         assertNotNull("networkError message must be surfaced", refreshAttempt.networkError)
     }
 
+    // Scenario 7b: Internet recovery after temporary Firestore outage — re-verifies from server
+    // WITHOUT re-login using preserved Firebase Auth session, and unlocks ONLY when admin-approved.
+    @Test
+    fun scenario7b_internetRecoveryAfterOutage_rechecksServerWithoutRelogin_andEnforcesAdminApproval() = runBlocking {
+        val backend = FakeApprovalBackend()
+        val repo = buildRepo(backend)
+        val uid = "cap_recover_7b"
+        backend.seedUser(uid, "recover7b@elbatal.com", "Pass1234", verified = true, name = "كابتن استعادة")
+        backend.captains[uid] = mutableMapOf(
+            "uid" to uid,
+            "fullName" to "كابتن استعادة",
+            "email" to "recover7b@elbatal.com",
+            "phone" to "01099887766",
+            "accountType" to "captain",
+            "role" to "captain",
+            "accountStatus" to "approved",
+            "isApproved" to true,
+            "status" to "active"
+        )
+
+        // 1. Captain has a valid Firebase Auth session and stale local operational Room state
+        backend.currentUid = uid
+        db.captainDao().insertOrUpdate(
+            CaptainEntity(
+                id = 1,
+                uid = uid,
+                fullName = "كابتن استعادة",
+                phoneNumber = "01099887766",
+                email = "recover7b@elbatal.com",
+                status = "active",
+                isOnline = true,
+                isLoggedIn = true
+            )
+        )
+
+        // 2. Temporary Firestore outage occurs
+        backend.serverDocFailure = RuntimeException("DEADLINE_EXCEEDED: Firestore server timeout")
+
+        // 3. Entry is blocked and local operational state is disabled (fail-closed)
+        val loginDuringOutage = repo.login("recover7b@elbatal.com", "Pass1234")
+        assertTrue("Login must fail closed during Firestore outage", loginDuringOutage is LoginOutcome.Error)
+        assertFalse("Local Room isLoggedIn must be false during outage", db.captainDao().getCaptain()?.isLoggedIn == true)
+        assertFalse("Local Room isOnline must be false during outage", db.captainDao().getCaptain()?.isOnline == true)
+        assertFalse("Approval state must remain closed during outage", repo.isCurrentSessionApproved)
+
+        val startupDuringOutage = repo.resolveStartupSessionState()
+        assertTrue("Startup check must fail closed during outage", startupDuringOutage is StartupSessionState.ApprovalCheckFailed)
+
+        // 4. Firebase Auth session is STILL preserved (no forced signOut)
+        assertEquals("Firebase Auth session must survive temporary Firestore outage", uid, backend.currentUid)
+
+        // 5. Internet returns — first test with PENDING admin status -> must STILL deny entry without re-login
+        backend.captains[uid]!!["accountStatus"] = "pending"
+        backend.captains[uid]!!["isApproved"] = false
+        backend.captains[uid]!!["status"] = "pending"
+        backend.serverDocFailure = null
+        val readsBeforePendingRecovery = backend.serverReadCount
+
+        val pendingRefresh = repo.refreshLiveAccountApproval()
+        assertTrue("Recovery check must read live server document", backend.serverReadCount > readsBeforePendingRecovery)
+        assertFalse("Pending account must remain denied after internet recovery", pendingRefresh.canEnterApp)
+        assertEquals(CaptainAccountStatus.PENDING, pendingRefresh.status)
+        assertFalse(db.captainDao().getCaptain()?.isLoggedIn == true)
+        assertFalse(db.captainDao().getCaptain()?.isOnline == true)
+        assertEquals("Auth session stays intact while awaiting admin approval", uid, backend.currentUid)
+
+        val startupPendingAfterRecovery = repo.resolveStartupSessionState()
+        assertTrue(
+            "Startup re-check without re-login must return AwaitingApproval when server doc is pending",
+            startupPendingAfterRecovery is StartupSessionState.AwaitingApproval
+        )
+
+        // 6. Admin approves the captain on server -> re-verification succeeds WITHOUT re-login!
+        backend.captains[uid]!!["accountStatus"] = "approved"
+        backend.captains[uid]!!["isApproved"] = true
+        backend.captains[uid]!!["status"] = "active"
+        val readsBeforeApprovedRecovery = backend.serverReadCount
+
+        val approvedRefresh = repo.refreshLiveAccountApproval()
+        assertTrue("Approved recovery must query Firestore server", backend.serverReadCount > readsBeforeApprovedRecovery)
+        assertTrue("Approved captain must be granted entry without re-login", approvedRefresh.canEnterApp)
+        assertEquals(CaptainAccountStatus.APPROVED, approvedRefresh.status)
+        assertTrue(repo.isCurrentSessionApproved)
+        assertTrue("Local Room isLoggedIn must reactivate after server approval", db.captainDao().getCaptain()?.isLoggedIn == true)
+
+        val startupApproved = repo.resolveStartupSessionState()
+        assertTrue(
+            "Startup session resolves directly to Authenticated without re-login once server confirms approval",
+            startupApproved is StartupSessionState.Authenticated
+        )
+        assertEquals(uid, backend.currentUid)
+    }
+
     // Scenario 8: Logout clears approval state & Room, relogin strictly re-queries Firestore server
     @Test
     fun scenario8_logoutClearsLocalApprovalState_andReloginReverifiesFromServer() = runBlocking {

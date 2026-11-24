@@ -325,7 +325,7 @@ fun AccountApprovalScreen(
                             )
                         }
 
-                        if (!statusFeedback.isNullOrBlank()) {
+                        if (!statusFeedback.isNullOrBlank() && statusFeedback != bodyText) {
                             Spacer(modifier = Modifier.height(12.dp))
                             Text(
                                 text = statusFeedback,
