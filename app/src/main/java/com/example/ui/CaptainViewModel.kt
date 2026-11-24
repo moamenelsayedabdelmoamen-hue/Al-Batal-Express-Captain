@@ -35,6 +35,7 @@ import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.ListenerRegistration
 import com.google.firebase.functions.FirebaseFunctionsException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -902,6 +903,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                     try {
                         repository.setOnlineStatus(true)
                     } catch (error: Exception) {
+                        if (error is CancellationException) throw error
                         _eventFlow.emit(UiEvent.ShowToast(shiftActivationErrorMessage(error)))
                         return@launch
                     }
@@ -970,6 +972,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                         repository.setCaptainReadyStatus(true)
                         repository.setOnlineStatus(true)
                     } catch (error: Exception) {
+                        if (error is CancellationException) throw error
                         captainState.value?.uid?.let { Log.e("CaptainViewModel", "Shift activation failed for captain $it", error) }
                         _eventFlow.emit(UiEvent.ShowToast(shiftActivationErrorMessage(error)))
                         return@launch
@@ -1009,6 +1012,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                 repository.setCaptainReadyStatus(true)
                 repository.setOnlineStatus(true)
             } catch (error: Exception) {
+                if (error is CancellationException) throw error
                 _eventFlow.emit(UiEvent.ShowToast(shiftActivationErrorMessage(error)))
                 return@launch
             }
