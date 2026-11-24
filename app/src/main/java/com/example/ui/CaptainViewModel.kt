@@ -34,6 +34,8 @@ import com.example.notifications.ShiftNotificationScheduler
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.ListenerRegistration
+import com.google.firebase.functions.FirebaseFunctionsException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -856,6 +858,29 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    private fun shiftActivationErrorMessage(error: Throwable): String {
+        val functionsError = error as? FirebaseFunctionsException
+        val serverMessage = functionsError?.message
+            ?.takeIf { message -> message.any { it in '\u0600'..'\u06FF' } }
+        if (!serverMessage.isNullOrBlank()) return serverMessage
+
+        return when (functionsError?.code) {
+            FirebaseFunctionsException.Code.UNAUTHENTICATED ->
+                "انتهت جلسة تسجيل الدخول. سجّل الدخول مرة أخرى."
+            FirebaseFunctionsException.Code.PERMISSION_DENIED ->
+                "حساب الكابتن غير معتمد أو لا يملك صلاحية تفعيل الشفت."
+            FirebaseFunctionsException.Code.FAILED_PRECONDITION ->
+                "لا يمكن تفعيل العمل حالياً. تحقق من موعد الشفت وتأكيد الجاهزية."
+            FirebaseFunctionsException.Code.NOT_FOUND ->
+                "ملف الكابتن أو بيانات الشفت غير موجودة على الخادم."
+            FirebaseFunctionsException.Code.UNAVAILABLE,
+            FirebaseFunctionsException.Code.DEADLINE_EXCEEDED ->
+                "الخادم غير متاح حالياً أو انتهت مهلة الاتصال. تحقق من الإنترنت وحاول مجدداً."
+            else ->
+                "تعذر تفعيل الشفت على الخادم. حاول مرة أخرى، وإذا تكررت المشكلة أرسل سجل الخطأ للدعم."
+        }
+    }
+
     fun toggleOnlineStatus() {
         val app = getApplication<Application>()
         val currentlyOnline = captainState.value?.isOnline == true
@@ -875,11 +900,19 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                         _eventFlow.emit(UiEvent.RequestGpsEnable)
                         return@launch
                     }
-                    repository.setOnlineStatus(true)
+                    try {
+                        repository.setOnlineStatus(true)
+                    } catch (error: Exception) {
+                        if (error is CancellationException) throw error
+                        _eventFlow.emit(UiEvent.ShowToast(shiftActivationErrorMessage(error)))
+                        return@launch
+                    }
                     if (repository.isEligibleForLocationTracking()) {
                         CaptainLocationTracker.startService(app)
                         repository.syncOrdersDetailedFromFirestore()
                         _eventFlow.emit(UiEvent.ShowToast("تم تفعيل العمل وGPS لهذا الشفت."))
+                    } else {
+                        _eventFlow.emit(UiEvent.ShowToast("لم يؤكد الخادم تفعيل العمل. أعد المحاولة بعد تحديث حالة الشفت."))
                     }
                     return@launch
                 }
@@ -935,14 +968,23 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                     return
                 }
                 viewModelScope.launch {
-                    repository.setCaptainReadyStatus(true)
-                    repository.setOnlineStatus(true)
+                    try {
+                        repository.setCaptainReadyStatus(true)
+                        repository.setOnlineStatus(true)
+                    } catch (error: Exception) {
+                        if (error is CancellationException) throw error
+                        captainState.value?.uid?.let { Log.e("CaptainViewModel", "Shift activation failed for captain $it", error) }
+                        _eventFlow.emit(UiEvent.ShowToast(shiftActivationErrorMessage(error)))
+                        return@launch
+                    }
                     if (repository.isEligibleForLocationTracking()) {
                         CaptainLocationTracker.startService(app)
                         if (auth?.currentUser?.isEmailVerified == true) {
                             repository.syncOrdersDetailedFromFirestore()
                         }
                         _eventFlow.emit(UiEvent.ShowToast("أنت الآن تعمل داخل الشفت ويمكنك استقبال الطلبات."))
+                    } else {
+                        _eventFlow.emit(UiEvent.ShowToast("تم تأكيد الجاهزية، لكن لم يكتمل تفعيل العمل محلياً. أعد المحاولة وتحقق من اتصال الإنترنت."))
                     }
                 }
             }
@@ -966,8 +1008,14 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                 _eventFlow.emit(UiEvent.ShowToast("تم منح إذن الموقع. لن يبدأ التتبع قبل بداية الشفت وتأكيد الجاهزية."))
                 return@launch
             }
-            repository.setCaptainReadyStatus(true)
-            repository.setOnlineStatus(true)
+            try {
+                repository.setCaptainReadyStatus(true)
+                repository.setOnlineStatus(true)
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                _eventFlow.emit(UiEvent.ShowToast(shiftActivationErrorMessage(error)))
+                return@launch
+            }
             if (repository.isEligibleForLocationTracking()) {
                 CaptainLocationTracker.startService(app)
                 if (auth?.currentUser?.isEmailVerified == true) {
@@ -975,7 +1023,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                 }
                 _eventFlow.emit(UiEvent.ShowToast("بدأ العمل وتم تفعيل GPS بنجاح."))
             } else {
-                _eventFlow.emit(UiEvent.ShowToast("لا يمكن تشغيل GPS قبل تأكيد الجاهزية وداخل الشفت."))
+                _eventFlow.emit(UiEvent.ShowToast("تم قبول الجاهزية لكن لم تكتمل حالة العمل. أعد المحاولة."))
             }
         }
     }
