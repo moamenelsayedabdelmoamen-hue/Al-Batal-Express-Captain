@@ -426,6 +426,15 @@ class CaptainAccountApprovalTest {
 
         val loginAttempt = repo.login("offline7@elbatal.com", "Pass1234")
         assertTrue("Login MUST fail closed on Firestore server read error", loginAttempt is LoginOutcome.Error)
+        assertEquals(
+            "A temporary Firestore outage must not destroy the Firebase Auth session",
+            uid,
+            backend.currentUid
+        )
+        assertFalse(
+            "A Firestore outage must never leave the local captain operational",
+            db.captainDao().getCaptain()?.isLoggedIn == true
+        )
 
         val refreshAttempt = repo.refreshLiveAccountApproval()
         assertFalse("Refresh MUST fail closed on network outage", refreshAttempt.canEnterApp)

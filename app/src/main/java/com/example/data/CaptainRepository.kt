@@ -40,6 +40,7 @@ import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 
@@ -240,13 +241,13 @@ class CaptainRepository(
 
             override suspend fun getCaptainDoc(uid: String): Map<String, Any?>? {
                 val docRef = firestore.collection("captains").document(uid)
-                val snap = docRef.get(Source.SERVER).await()
+                val snap = withTimeout(20_000L) { docRef.get(Source.SERVER).await() }
                 return if (snap.exists()) (snap.data ?: emptyMap()) else null
             }
 
             override suspend fun getCaptainDocFromServer(uid: String): Map<String, Any?>? {
                 val docRef = firestore.collection("captains").document(uid)
-                val snap = docRef.get(Source.SERVER).await()
+                val snap = withTimeout(20_000L) { docRef.get(Source.SERVER).await() }
                 return if (snap.exists()) (snap.data ?: emptyMap()) else null
             }
 
@@ -1719,9 +1720,13 @@ class CaptainRepository(
             authBackend.getCaptainDocFromServer(uid)
         } catch (e: Exception) {
             Log.e("CaptainRepository", "Failed reading captains/$uid during login: ${e.message}", e)
-            authBackend.signOut()
+            // Keep the Firebase Auth identity so the captain can retry after a transient
+            // Firestore outage. Operational access remains closed until server approval succeeds.
             captainDao.updateLoginState(false)
+            captainDao.updateOnlineStatus(false)
             _accountApprovalState.value = null
+            stopRealtimeOrdersListener()
+            stopRealtimeShiftListener()
             val fsEx = e as? FirebaseFirestoreException
             val errMessage = if (fsEx?.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
                 "تم رفض قراءة بيانات الكابتن من قواعد الأمان (PERMISSION_DENIED) للمسار captains/$uid."

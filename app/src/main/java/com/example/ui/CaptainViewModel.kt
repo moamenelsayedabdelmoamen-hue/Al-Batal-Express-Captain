@@ -2052,7 +2052,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
     }
 
     companion object {
-        const val STARTUP_SESSION_CHECK_TIMEOUT_MS = 8_000L
+        const val STARTUP_SESSION_CHECK_TIMEOUT_MS = 25_000L
         private val BLOCKED_ACCOUNT_STATUSES = setOf("banned", "suspended", "disabled", "blocked")
         private val INACTIVE_ACCOUNT_STATUSES = BLOCKED_ACCOUNT_STATUSES + setOf("pending", "inactive")
 
