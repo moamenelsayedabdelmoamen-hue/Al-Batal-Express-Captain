@@ -8,6 +8,8 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
 import com.example.data.location.GpsConfig
+import com.example.data.remote.CloudFunctionsOrderClient
+import com.google.firebase.FirebaseApp
 import com.google.firebase.Timestamp
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseAuthInvalidCredentialsException
@@ -47,6 +49,35 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.tasks.await
+
+enum class PresenceErrorReason {
+    UNAUTHENTICATED,
+    PERMISSION_DENIED,
+    FAILED_PRECONDITION,
+    NOT_FOUND,
+    UNAVAILABLE,
+    DEADLINE_EXCEEDED
+}
+
+class CaptainPresenceException(
+    val reason: PresenceErrorReason,
+    val userMessage: String,
+    cause: Throwable? = null
+) : Exception(userMessage, cause)
+
+data class ServerConfirmedWorkingSession(
+    val uid: String,
+    val workStatus: String,
+    val readyConfirmed: Boolean,
+    val readyShiftKey: String,
+    val workingShiftKey: String
+) {
+    val isConfirmedWorking: Boolean
+        get() = workStatus == "working" &&
+            readyConfirmed &&
+            readyShiftKey.isNotBlank() &&
+            workingShiftKey == readyShiftKey
+}
 
 sealed class LoginOutcome {
     object Success : LoginOutcome()
@@ -173,6 +204,23 @@ class CaptainRepository(
     private val _accountApprovalState = MutableStateFlow<CaptainApprovalSnapshot?>(null)
     val accountApprovalState: StateFlow<CaptainApprovalSnapshot?> = _accountApprovalState.asStateFlow()
 
+    // Strictly in-memory server-confirmed shift presence state (NEVER trusted from local Room isOnline).
+    private val _serverConfirmedWorkingSession = MutableStateFlow<ServerConfirmedWorkingSession?>(null)
+    val serverConfirmedWorkingSession: StateFlow<ServerConfirmedWorkingSession?> =
+        _serverConfirmedWorkingSession.asStateFlow()
+
+    private val ordersListenerLock = Any()
+    @Volatile
+    private var activeOrdersListenerUid: String? = null
+    @Volatile
+    private var activeOrdersListenerShiftKey: String? = null
+
+    internal var ordersListenerAttachmentOverride:
+        ((uid: String, shiftKey: String) -> List<ListenerRegistration>)? = null
+
+    internal val activeOrdersListenerCount: Int
+        get() = synchronized(ordersListenerLock) { ordersListenerRegistrations.size }
+
     val isCurrentSessionApproved: Boolean
         get() = _accountApprovalState.value?.canEnterApp == true
 
@@ -181,6 +229,10 @@ class CaptainRepository(
 
     internal fun setAccountApprovalSnapshot(snapshot: CaptainApprovalSnapshot?) {
         _accountApprovalState.value = snapshot
+    }
+
+    internal fun clearServerConfirmedWorkingSession() {
+        _serverConfirmedWorkingSession.value = null
     }
 
     private fun resolveCurrentCaptainUid(): String? {
@@ -194,13 +246,51 @@ class CaptainRepository(
             ?: runCatching { cloudMetadataPort.currentAuthUid() }.getOrNull()?.takeIf { it.isNotBlank() }
     }
 
-    private fun isConfirmedPresenceRejection(error: Throwable): Boolean {
+    internal var presenceCallableOverride: (suspend (action: String) -> Unit)? = null
+
+    private fun presenceFunctions(): FirebaseFunctions =
+        FirebaseFunctions.getInstance(
+            FirebaseApp.getInstance(),
+            CloudFunctionsOrderClient.FUNCTIONS_REGION
+        )
+
+    private suspend fun invokeShiftPresenceCallable(action: String) {
+        val override = presenceCallableOverride
+        if (override != null) {
+            withContext(Dispatchers.IO) {
+                withTimeout(PRESENCE_CALLABLE_TIMEOUT_MS) {
+                    override(action)
+                }
+            }
+            return
+        }
+        withContext(Dispatchers.IO) {
+            withTimeout(PRESENCE_CALLABLE_TIMEOUT_MS) {
+                presenceFunctions()
+                    .getHttpsCallable("updateCaptainShiftPresence")
+                    .call(mapOf("action" to action))
+                    .await()
+            }
+        }
+    }
+
+    internal fun isConfirmedPresenceRejection(error: Throwable): Boolean {
+        if (error is CaptainPresenceException) {
+            return error.reason in setOf(
+                PresenceErrorReason.UNAUTHENTICATED,
+                PresenceErrorReason.PERMISSION_DENIED,
+                PresenceErrorReason.FAILED_PRECONDITION,
+                PresenceErrorReason.NOT_FOUND
+            )
+        }
         val ffe = error as? FirebaseFunctionsException ?: return false
         return ffe.code in setOf(
             FirebaseFunctionsException.Code.FAILED_PRECONDITION,
             FirebaseFunctionsException.Code.PERMISSION_DENIED,
             FirebaseFunctionsException.Code.UNAUTHENTICATED,
-            FirebaseFunctionsException.Code.INVALID_ARGUMENT
+            FirebaseFunctionsException.Code.INVALID_ARGUMENT,
+            FirebaseFunctionsException.Code.NOT_FOUND,
+            FirebaseFunctionsException.Code.UNIMPLEMENTED
         )
     }
 
@@ -225,45 +315,12 @@ class CaptainRepository(
         return false
     }
 
-    private suspend fun updateCaptainPresenceDirectInFirestore(
-        uid: String,
-        fullPayload: Map<String, Any>,
-        minimalPayload: Map<String, Any>,
-        fallbackKey: String,
-        isWorking: Boolean
-    ) {
-        withContext(Dispatchers.IO) {
-            try {
-                withTimeout(PRESENCE_CALLABLE_TIMEOUT_MS) {
-                    firestore.collection("captains").document(uid)
-                        .update(fullPayload)
-                        .await()
-                }
-                if (isWorking) {
-                    directWorkingFallbackKey = null
-                } else {
-                    directReadyFallbackKey = null
-                }
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (e: FirebaseFirestoreException) {
-                if (e.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
-                    withTimeout(PRESENCE_CALLABLE_TIMEOUT_MS) {
-                        firestore.collection("captains").document(uid)
-                            .update(minimalPayload)
-                            .await()
-                    }
-                    val normalizedFallbackKey = fallbackKey.takeIf { it.isNotBlank() }
-                    if (isWorking) {
-                        directWorkingFallbackKey = normalizedFallbackKey
-                    } else {
-                        directReadyFallbackKey = normalizedFallbackKey
-                    }
-                } else {
-                    throw e
-                }
-            }
-        }
+    suspend fun revertLocalOnlineStatusToOffline() {
+        _serverConfirmedWorkingSession.value = null
+        stopRealtimeOrdersListener()
+        captainDao.updateOnlineStatus(false)
+        orderDao.deleteAllPendingOrders()
+        context?.let { CaptainNotificationManager.stopIncomingOrderBell(it) }
     }
 
     private val authBackend: CaptainAuthBackendPort by lazy {
@@ -699,40 +756,85 @@ class CaptainRepository(
     /**
      * Checks whether the captain is eligible to be assigned or receive new/pending orders.
      * Enforces:
-     * 1. Captain exists and isOnline == true (never assign when offline).
-     * 2. Account status is not suspended/banned/pending/inactive.
-     * 3. When shift schedules exist, current Cairo time falls inside an active shift.
+     * 1. Captain exists and local isOnline == true.
+     * 2. Account is approved (never pending/suspended/blocked/rejected).
+     * 3. Current Cairo time falls inside an active scheduled shift.
+     * 4. Server has explicitly confirmed workStatus == "working" with matching readyShiftKey & workingShiftKey.
      */
-    private suspend fun isCaptainEligibleForNewOrders(captain: CaptainEntity?): Boolean {
+    internal suspend fun isCaptainEligibleForNewOrders(captain: CaptainEntity?): Boolean {
         if (captain == null || !captain.isOnline) {
             return false
         }
+        if (_accountApprovalState.value != null && !isCurrentSessionApproved) {
+            return false
+        }
         val normalizedStatus = captain.status.trim().lowercase()
-        if (normalizedStatus in listOf("banned", "suspended", "disabled", "blocked", "pending", "inactive")) {
+        if (normalizedStatus in listOf("banned", "suspended", "disabled", "blocked", "pending", "inactive", "rejected")) {
             return false
         }
         val currentShifts = getShifts()
-        if (currentShifts.isNotEmpty()) {
-            val shiftStatus = ShiftManager.calculateShiftStatus(currentShifts)
-            if (!shiftStatus.isAvailableForOrders) {
-                return false
-            }
-        }
-        return true
+        val activeShift = ShiftManager.calculateShiftStatus(currentShifts) as? ShiftStatus.Active
+            ?: return false
+        val expectedShiftKey = buildShiftInstanceKey(activeShift.shift)
+        val confirmed = _serverConfirmedWorkingSession.value ?: return false
+        val resolvedUid = resolveCurrentCaptainUid()?.takeIf { it.isNotBlank() } ?: captain.uid
+        return confirmed.isConfirmedWorking &&
+            confirmed.uid == resolvedUid &&
+            confirmed.readyShiftKey == expectedShiftKey &&
+            confirmed.workingShiftKey == expectedShiftKey
     }
 
     fun startRealtimeOrdersListener() {
-        stopRealtimeOrdersListener()
-        if (hasTestBackendOverride) return
-        // Same guard as startRealtimeShiftListener: FirebaseAuth throws if Firebase is not initialized.
-        val currentUser = runCatching { firebaseAuth.currentUser }.getOrNull()
-        if (currentUser == null) {
+        if (_accountApprovalState.value != null && !isCurrentSessionApproved) {
+            stopRealtimeOrdersListener()
+            Log.d("CaptainRepository", "[FirestoreOrdersListener] Blocked: captain account is not approved")
+            return
+        }
+        val authUid = if (hasTestBackendOverride || ordersListenerAttachmentOverride != null) {
+            resolveCurrentCaptainUid()
+        } else {
+            runCatching { firebaseAuth.currentUser?.uid }.getOrNull()
+        }
+        if (authUid.isNullOrBlank()) {
+            stopRealtimeOrdersListener()
             Log.d("CaptainRepository", "[FirestoreOrdersListener] Waiting for captain authentication before starting orders listener")
             return
         }
-        val authUid = currentUser.uid
+        val confirmed = _serverConfirmedWorkingSession.value
+        if (confirmed == null || !confirmed.isConfirmedWorking || confirmed.uid != authUid) {
+            stopRealtimeOrdersListener()
+            Log.d("CaptainRepository", "[FirestoreOrdersListener] Blocked: server has not confirmed working shift state for captain $authUid")
+            return
+        }
+        val confirmedShiftKey = confirmed.workingShiftKey
+        synchronized(ordersListenerLock) {
+            if (ordersListenerRegistrations.isNotEmpty() &&
+                activeOrdersListenerUid == authUid &&
+                activeOrdersListenerShiftKey == confirmedShiftKey
+            ) {
+                Log.d("CaptainRepository", "[FirestoreOrdersListener] Reusing active orders listeners for $authUid ($confirmedShiftKey)")
+                return
+            }
+            ordersListenerRegistrations.forEach { runCatching { it.remove() } }
+            ordersListenerRegistrations.clear()
+            activeOrdersListenerUid = null
+            activeOrdersListenerShiftKey = null
+
+            val overrideFactory = ordersListenerAttachmentOverride
+            if (overrideFactory != null) {
+                val attached = overrideFactory(authUid, confirmedShiftKey)
+                ordersListenerRegistrations.addAll(attached)
+                if (attached.isNotEmpty()) {
+                    activeOrdersListenerUid = authUid
+                    activeOrdersListenerShiftKey = confirmedShiftKey
+                }
+                return
+            }
+            if (hasTestBackendOverride) return
+        }
+
         try {
-            Log.i("CaptainRepository", "[FirestoreOrdersListener] Registering least-privilege scoped listeners on 'orders' for captain $authUid...")
+            Log.i("CaptainRepository", "[FirestoreOrdersListener] Registering least-privilege scoped listeners on 'orders' for working captain $authUid ($confirmedShiftKey)...")
 
             fun processOrderDocuments(
                 docs: List<DocumentSnapshot>,
@@ -906,8 +1008,9 @@ class CaptainRepository(
                 }
             }
 
+            val newRegistrations = mutableListOf<ListenerRegistration>()
             // 1. Available pending orders scoped to this captain (matches firestore.rules isAvailablePendingOrder)
-            ordersListenerRegistrations += firestore.collection("orders")
+            newRegistrations += firestore.collection("orders")
                 .whereEqualTo("status", "pending")
                 .whereEqualTo("offeredCaptainId", authUid)
                 .addSnapshotListener { snapshot, error ->
@@ -925,7 +1028,7 @@ class CaptainRepository(
 
             // 2. Captain's own assigned / offered orders (matches firestore.rules isOrderAssignedOrOfferedToCaptain)
             for (field in listOf("captainId", "driverId", "captainUid", "assignedCaptainId", "offeredCaptainId")) {
-                ordersListenerRegistrations += firestore.collection("orders")
+                newRegistrations += firestore.collection("orders")
                     .whereEqualTo(field, authUid)
                     .addSnapshotListener { snapshot, error ->
                         if (error != null) {
@@ -936,6 +1039,22 @@ class CaptainRepository(
                             processOrderDocuments(snapshot.documents)
                         }
                     }
+            }
+            synchronized(ordersListenerLock) {
+                val stillConfirmed = _serverConfirmedWorkingSession.value
+                if (stillConfirmed != null &&
+                    stillConfirmed.isConfirmedWorking &&
+                    stillConfirmed.uid == authUid &&
+                    stillConfirmed.workingShiftKey == confirmedShiftKey
+                ) {
+                    ordersListenerRegistrations.forEach { runCatching { it.remove() } }
+                    ordersListenerRegistrations.clear()
+                    ordersListenerRegistrations.addAll(newRegistrations)
+                    activeOrdersListenerUid = authUid
+                    activeOrdersListenerShiftKey = confirmedShiftKey
+                } else {
+                    newRegistrations.forEach { runCatching { it.remove() } }
+                }
             }
         } catch (e: Exception) {
             Log.w("CaptainRepository", "[FirestoreOrdersListener] Error starting Firestore listener: ${e.message}")
@@ -1360,8 +1479,12 @@ class CaptainRepository(
      * Stops realtime orders listeners.
      */
     fun stopRealtimeOrdersListener() {
-        ordersListenerRegistrations.forEach { it.remove() }
-        ordersListenerRegistrations.clear()
+        synchronized(ordersListenerLock) {
+            ordersListenerRegistrations.forEach { runCatching { it.remove() } }
+            ordersListenerRegistrations.clear()
+            activeOrdersListenerUid = null
+            activeOrdersListenerShiftKey = null
+        }
     }
 
     /**
@@ -1742,7 +1865,7 @@ class CaptainRepository(
         docData: Map<String, Any?>,
         fallbackPhone: String = "",
         isLoggedIn: Boolean = true,
-        isOnline: Boolean = true
+        isOnline: Boolean = false
     ): CaptainEntity {
         val fullName = docData.mapString("name", "fullName", default = authDisplayName.ifBlank { "كابتن البطل" })
         val rawPhone = docData.mapString("phone", "phoneNumber", default = fallbackPhone)
@@ -1776,7 +1899,11 @@ class CaptainRepository(
             accountType = resolvedAccountType.ifBlank { CAPTAIN_ACCOUNT_TYPE },
             role = resolvedRole.ifBlank { CAPTAIN_ROLE },
             status = docData.mapString("status", default = "active").lowercase(),
-            availabilityStatus = docData.mapString("availabilityStatus", default = if (isOnline) "available" else "offline"),
+            availabilityStatus = if (isOnline) {
+                docData.mapString("availabilityStatus", default = "working")
+            } else {
+                "offline"
+            },
             shiftStatus = docData.mapString("shiftStatus", default = "outside_shift"),
             vehicleType = docData.mapString("vehicleType", "vehicle", default = "سكوتر / دراجة نارية"),
             licensePlate = docData.mapString("licensePlate", default = "أ ب ج 1 2 3"),
@@ -1942,6 +2069,11 @@ class CaptainRepository(
             return LoginOutcome.AwaitingApproval(approvalSnapshot)
         }
 
+        // Authentication is strictly decoupled from shift presence:
+        // always start locally offline after login until the server confirms shift activation.
+        _serverConfirmedWorkingSession.value = null
+        stopRealtimeOrdersListener()
+
         val captainEntity = buildCaptainEntityFromDoc(
             uid = uid,
             authEmail = resolvedEmail,
@@ -1949,7 +2081,7 @@ class CaptainRepository(
             docData = validDoc,
             fallbackPhone = if (!isEmail) PhoneAuthRegistry.normalizeEgyptianPhone(cleanedInput) else "",
             isLoggedIn = true,
-            isOnline = true
+            isOnline = false
         )
 
         if (captainEntity.phoneNumber.isNotBlank()) {
@@ -1957,25 +2089,21 @@ class CaptainRepository(
         }
         captainDao.insertOrUpdate(captainEntity)
 
-        // 6. Sync verified login & online state strictly on captains/{uid}
+        // 6. Sync verified authentication fields ONLY on captains/{uid} (never assert isOnline=true on login)
         runCatching {
             authBackend.updateCaptainDoc(
                 uid,
                 mapOf(
                     "emailVerified" to true,
                     "isEmailVerified" to true,
-                    "isOnline" to true,
                     "isLoggedIn" to true,
-                    "availabilityStatus" to "available",
-                    "presenceStatus" to "available",
                     "updatedAt" to FieldValue.serverTimestamp()
                 )
             )
         }
 
-        // 7. Start realtime listeners & shift/orders sync ONLY when real listeners are active
+        // 7. Start shift schedule listener ONLY; orders listener starts only after server confirms working state.
         if (!hasTestBackendOverride) {
-            startRealtimeOrdersListener()
             startRealtimeShiftListener()
             CoroutineScope(Dispatchers.IO).launch {
                 syncShiftsFromFirestore()
@@ -2085,6 +2213,12 @@ class CaptainRepository(
             }
 
             val current = captainDao.getCaptain()
+            val restoredSession = reconcileServerPresenceFromDoc(
+                uid = uid,
+                docData = validDoc,
+                shifts = getShifts()
+            )
+            val restoredIsOnline = restoredSession != null
             val refreshed = buildCaptainEntityFromDoc(
                 uid = uid,
                 authEmail = reloadedUser.email,
@@ -2092,15 +2226,20 @@ class CaptainRepository(
                 docData = validDoc,
                 fallbackPhone = current?.phoneNumber.orEmpty(),
                 isLoggedIn = true,
-                isOnline = current?.isOnline ?: (validDoc["isOnline"] as? Boolean ?: true)
+                isOnline = restoredIsOnline
             )
             if (refreshed.phoneNumber.isNotBlank() && refreshed.email.isNotBlank()) {
                 PhoneAuthRegistry.savePhoneEmailMapping(context, refreshed.phoneNumber, refreshed.email)
             }
             captainDao.insertOrUpdate(refreshed)
 
-            if (!hasTestBackendOverride) {
+            if (restoredSession?.isConfirmedWorking == true) {
                 startRealtimeOrdersListener()
+            } else {
+                stopRealtimeOrdersListener()
+            }
+
+            if (!hasTestBackendOverride) {
                 startRealtimeShiftListener()
                 CoroutineScope(Dispatchers.IO).launch {
                     reconcileDailyWallets()
@@ -2112,6 +2251,7 @@ class CaptainRepository(
         } catch (e: Exception) {
             // FAIL-CLOSED: Never trust Room or local cache as an approval source when Firestore check fails!
             Log.w("CaptainRepository", "Fail-closed startup approval verification error: ${e.message}")
+            _serverConfirmedWorkingSession.value = null
             captainDao.updateLoginState(false)
             captainDao.updateOnlineStatus(false)
             orderDao.deleteAllPendingOrders()
@@ -2185,7 +2325,8 @@ class CaptainRepository(
         uid: String,
         docData: Map<String, Any?>?,
         authEmail: String = "",
-        authDisplayName: String = ""
+        authDisplayName: String = "",
+        isServerConfirmedDoc: Boolean = true
     ): CaptainApprovalSnapshot {
         val current = captainDao.getCaptain()
         val resolvedEmail = authEmail.ifBlank { current?.email.orEmpty() }
@@ -2198,6 +2339,15 @@ class CaptainRepository(
         _accountApprovalState.value = snapshot
 
         if (snapshot.canEnterApp && docData != null) {
+            val restoredSession = if (isServerConfirmedDoc) {
+                reconcileServerPresenceFromDoc(
+                    uid = uid,
+                    docData = docData,
+                    shifts = getShifts()
+                )
+            } else {
+                _serverConfirmedWorkingSession.value?.takeIf { it.uid == uid }
+            }
             val refreshed = buildCaptainEntityFromDoc(
                 uid = uid,
                 authEmail = resolvedEmail,
@@ -2205,12 +2355,16 @@ class CaptainRepository(
                 docData = docData,
                 fallbackPhone = current?.phoneNumber.orEmpty(),
                 isLoggedIn = true,
-                isOnline = current?.isOnline ?: (docData["isOnline"] as? Boolean ?: true)
+                isOnline = restoredSession != null
             )
             captainDao.insertOrUpdate(refreshed)
+            if (restoredSession?.isConfirmedWorking == true) {
+                startRealtimeOrdersListener()
+            } else {
+                stopRealtimeOrdersListener()
+            }
             if (!hasTestBackendOverride) {
                 syncFcmToken()
-                startRealtimeOrdersListener()
                 startRealtimeShiftListener()
             }
         } else {
@@ -2233,6 +2387,7 @@ class CaptainRepository(
         docData: Map<String, Any?>?,
         authUser: AuthUserSnapshot
     ) {
+        _serverConfirmedWorkingSession.value = null
         stopRealtimeOrdersListener()
         stopRealtimeShiftListener()
         orderDao.deleteAllPendingOrders()
@@ -2487,7 +2642,7 @@ class CaptainRepository(
             phoneNumber = phoneFallback,
             email = emailFallback,
             isLoggedIn = true,
-            isOnline = true
+            isOnline = false
         )).copy(
             uid = uid,
             isLoggedIn = true,
@@ -2832,6 +2987,9 @@ class CaptainRepository(
                 return Result.success(true)
             }
 
+            _serverConfirmedWorkingSession.value = null
+            stopRealtimeOrdersListener()
+
             val verifiedCaptain = buildCaptainEntityFromDoc(
                 uid = reloaded.uid,
                 authEmail = reloaded.email,
@@ -2839,7 +2997,7 @@ class CaptainRepository(
                 docData = validDoc,
                 fallbackPhone = current?.phoneNumber.orEmpty(),
                 isLoggedIn = true,
-                isOnline = true
+                isOnline = false
             )
             captainDao.insertOrUpdate(verifiedCaptain)
 
@@ -2850,9 +3008,6 @@ class CaptainRepository(
                         "emailVerified" to true,
                         "isEmailVerified" to true,
                         "isLoggedIn" to true,
-                        "isOnline" to true,
-                        "availabilityStatus" to "available",
-                        "presenceStatus" to "available",
                         "updatedAt" to FieldValue.serverTimestamp()
                     )
                 )
@@ -2860,7 +3015,6 @@ class CaptainRepository(
 
             if (!hasTestBackendOverride) {
                 syncFcmToken()
-                startRealtimeOrdersListener()
                 startRealtimeShiftListener()
             }
 
@@ -2890,11 +3044,28 @@ class CaptainRepository(
     @Volatile
     private var pendingOfflineServerSync: Boolean = false
 
-    /** Fail-closed local guard; server independently validates workStatus, schedule and GPS freshness. */
-    private fun buildShiftInstanceKey(shift: ShiftEntity): String {
-        val calendar = ShiftManager.getCurrentCairoCalendar()
-        if (shift.dayOfWeek != calendar.get(Calendar.DAY_OF_WEEK)) {
-            calendar.add(Calendar.DAY_OF_YEAR, -1)
+    /**
+     * Canonical shift instance key matching Backend `updateCaptainShiftPresence` verbatim:
+     * `yyyy-MM-dd|dayKey|HHmm` in `Africa/Cairo`.
+     * - Overnight shifts active after midnight resolve to yesterday's start date & dayKey.
+     * - Midnight-crossing upcoming shifts resolve to tomorrow's start date & dayKey.
+     */
+    internal fun buildShiftInstanceKey(
+        shift: ShiftEntity,
+        nowCal: Calendar = ShiftManager.getCurrentCairoCalendar()
+    ): String {
+        val calendar = (nowCal.clone() as Calendar).apply {
+            timeZone = ShiftManager.CAIRO_TIME_ZONE
+        }
+        val todayDayOfWeek = calendar.get(Calendar.DAY_OF_WEEK)
+        if (shift.dayOfWeek != todayDayOfWeek) {
+            val yesterdayDayOfWeek = if (todayDayOfWeek == Calendar.SUNDAY) Calendar.SATURDAY else todayDayOfWeek - 1
+            val tomorrowDayOfWeek = if (todayDayOfWeek == Calendar.SATURDAY) Calendar.SUNDAY else todayDayOfWeek + 1
+            when (shift.dayOfWeek) {
+                yesterdayDayOfWeek -> calendar.add(Calendar.DAY_OF_YEAR, -1)
+                tomorrowDayOfWeek -> calendar.add(Calendar.DAY_OF_YEAR, 1)
+                else -> calendar.add(Calendar.DAY_OF_YEAR, -1)
+            }
         }
         val dayKey = when (shift.dayOfWeek) {
             Calendar.SATURDAY -> "saturday"
@@ -2910,7 +3081,86 @@ class CaptainRepository(
             timeZone = ShiftManager.CAIRO_TIME_ZONE
         }.format(calendar.time)
         val startMinutes = ShiftManager.parseTimeToMinutes(shift.startTime)
-        return "$dateKey|$dayKey|${startMinutes.toString().padStart(4, '0')}"
+        val startHour = (startMinutes / 60).coerceIn(0, 23)
+        val startMinute = (startMinutes % 60).coerceIn(0, 59)
+        val hhmm = String.format(Locale.US, "%02d%02d", startHour, startMinute)
+        return "$dateKey|$dayKey|$hhmm"
+    }
+
+    /**
+     * Evaluates a server-read `captains/{uid}` document against the captain's scheduled Cairo shift
+     * and updates `_serverConfirmedWorkingSession` strictly when server fields and `shiftKey` match.
+     */
+    internal fun reconcileServerPresenceFromDoc(
+        uid: String,
+        docData: Map<String, Any?>,
+        shifts: List<ShiftEntity>,
+        nowCal: Calendar = ShiftManager.getCurrentCairoCalendar()
+    ): ServerConfirmedWorkingSession? {
+        val status = ShiftManager.calculateShiftStatus(shifts, nowCal)
+        val serverIsOnline = docData["isOnline"] == true
+        val workStatus = docData["workStatus"]?.toString()?.trim()?.lowercase().orEmpty()
+        val readyConfirmed = docData["readyConfirmed"] == true
+        val readyShiftKey = docData["readyShiftKey"]?.toString()?.trim().orEmpty()
+        val workingShiftKey = docData["workingShiftKey"]?.toString()?.trim().orEmpty()
+
+        val resolved: ServerConfirmedWorkingSession? = when (status) {
+            is ShiftStatus.Active -> {
+                val expectedShiftKey = buildShiftInstanceKey(status.shift, nowCal)
+                when {
+                    serverIsOnline &&
+                        workStatus == "working" &&
+                        readyConfirmed &&
+                        readyShiftKey == expectedShiftKey &&
+                        workingShiftKey == expectedShiftKey -> {
+                        ServerConfirmedWorkingSession(
+                            uid = uid,
+                            workStatus = "working",
+                            readyConfirmed = true,
+                            readyShiftKey = readyShiftKey,
+                            workingShiftKey = workingShiftKey
+                        )
+                    }
+                    serverIsOnline &&
+                        workStatus == "ready" &&
+                        readyConfirmed &&
+                        readyShiftKey == expectedShiftKey -> {
+                        ServerConfirmedWorkingSession(
+                            uid = uid,
+                            workStatus = "ready",
+                            readyConfirmed = true,
+                            readyShiftKey = readyShiftKey,
+                            workingShiftKey = ""
+                        )
+                    }
+                    else -> null
+                }
+            }
+            is ShiftStatus.UpcomingSoon -> {
+                val inReadyWindow = status.millisUntilStart in 1L..(30L * 60_000L)
+                val expectedShiftKey = buildShiftInstanceKey(status.shift, nowCal)
+                if (inReadyWindow &&
+                    serverIsOnline &&
+                    workStatus == "ready" &&
+                    readyConfirmed &&
+                    readyShiftKey == expectedShiftKey
+                ) {
+                    ServerConfirmedWorkingSession(
+                        uid = uid,
+                        workStatus = "ready",
+                        readyConfirmed = true,
+                        readyShiftKey = readyShiftKey,
+                        workingShiftKey = ""
+                    )
+                } else {
+                    null
+                }
+            }
+            else -> null
+        }
+
+        _serverConfirmedWorkingSession.value = resolved
+        return resolved
     }
 
     suspend fun hasConfirmedShiftReadiness(): Boolean {
@@ -2926,22 +3176,37 @@ class CaptainRepository(
         val expectedShiftKey = buildShiftInstanceKey(active.shift)
         if (authBackendOverride != null) {
             val doc = authBackendOverride.getCaptainDocFromServer(user.uid) ?: return false
-            return doc["workStatus"] == "ready" &&
+            val ready = doc["workStatus"] == "ready" &&
                 doc["readyConfirmed"] == true &&
                 doc["readyShiftKey"] == expectedShiftKey
+            if (ready) {
+                _serverConfirmedWorkingSession.value = ServerConfirmedWorkingSession(
+                    uid = user.uid,
+                    workStatus = "ready",
+                    readyConfirmed = true,
+                    readyShiftKey = expectedShiftKey,
+                    workingShiftKey = ""
+                )
+            }
+            return ready
         }
         val snap = withTimeout(20_000L) {
             firestore.collection("captains").document(user.uid).get(Source.SERVER).await()
         }
-        val strictReady = snap.exists() &&
+        val ready = snap.exists() &&
             snap.getString("workStatus") == "ready" &&
             snap.getBoolean("readyConfirmed") == true &&
             snap.getString("readyShiftKey") == expectedShiftKey
-        val fallbackReady = snap.exists() &&
-            directReadyFallbackKey == "${user.uid}|$expectedShiftKey" &&
-            snap.getBoolean("isOnline") == true &&
-            snap.getString("presenceStatus") == "ready"
-        return strictReady || fallbackReady
+        if (ready) {
+            _serverConfirmedWorkingSession.value = ServerConfirmedWorkingSession(
+                uid = user.uid,
+                workStatus = "ready",
+                readyConfirmed = true,
+                readyShiftKey = expectedShiftKey,
+                workingShiftKey = ""
+            )
+        }
+        return ready
     }
 
     /**
@@ -2950,6 +3215,8 @@ class CaptainRepository(
      */
     suspend fun checkLocationTrackingEligibility(): LocationEligibilityResult {
         if (_accountApprovalState.value != null && !isCurrentSessionApproved) {
+            _serverConfirmedWorkingSession.value = null
+            stopRealtimeOrdersListener()
             return LocationEligibilityResult.Ineligible("account_not_approved")
         }
         val user = if (hasTestBackendOverride) {
@@ -2958,17 +3225,33 @@ class CaptainRepository(
             runCatching { firebaseAuth.currentUser }.getOrNull()?.let {
                 AuthUserSnapshot(it.uid, it.email.orEmpty(), it.isEmailVerified, it.displayName.orEmpty())
             }
-        } ?: return LocationEligibilityResult.Ineligible("unauthenticated")
+        } ?: run {
+            _serverConfirmedWorkingSession.value = null
+            stopRealtimeOrdersListener()
+            return LocationEligibilityResult.Ineligible("unauthenticated")
+        }
         if (!user.isEmailVerified) {
+            _serverConfirmedWorkingSession.value = null
+            stopRealtimeOrdersListener()
             return LocationEligibilityResult.Ineligible("email_not_verified")
         }
         val captain = captainDao.getCaptain()
-            ?: return LocationEligibilityResult.Ineligible("no_local_captain")
+            ?: run {
+                _serverConfirmedWorkingSession.value = null
+                stopRealtimeOrdersListener()
+                return LocationEligibilityResult.Ineligible("no_local_captain")
+            }
         if (!captain.isOnline) {
+            _serverConfirmedWorkingSession.value = null
+            stopRealtimeOrdersListener()
             return LocationEligibilityResult.Ineligible("captain_offline")
         }
         val active = ShiftManager.calculateShiftStatus(getShifts()) as? ShiftStatus.Active
-            ?: return LocationEligibilityResult.Ineligible("no_active_shift")
+            ?: run {
+                _serverConfirmedWorkingSession.value = null
+                stopRealtimeOrdersListener()
+                return LocationEligibilityResult.Ineligible("no_active_shift")
+            }
         val expectedShiftKey = buildShiftInstanceKey(active.shift)
 
         if (authBackendOverride != null) {
@@ -2978,7 +3261,11 @@ class CaptainRepository(
                 throw cancelled
             } catch (e: Exception) {
                 return LocationEligibilityResult.NetworkError(e)
-            } ?: return LocationEligibilityResult.Ineligible("captain_doc_missing")
+            } ?: run {
+                _serverConfirmedWorkingSession.value = null
+                stopRealtimeOrdersListener()
+                return LocationEligibilityResult.Ineligible("captain_doc_missing")
+            }
 
             val lastServerLocationTimestamp = (doc["lastLocationTimestamp"] as? Number)?.toLong() ?: 0L
             if (lastServerLocationTimestamp > lastLocationUploadTimestamp) {
@@ -2990,8 +3277,17 @@ class CaptainRepository(
                 doc["readyShiftKey"] == expectedShiftKey &&
                 doc["workingShiftKey"] == expectedShiftKey
             return if (eligible) {
+                _serverConfirmedWorkingSession.value = ServerConfirmedWorkingSession(
+                    uid = user.uid,
+                    workStatus = "working",
+                    readyConfirmed = true,
+                    readyShiftKey = expectedShiftKey,
+                    workingShiftKey = expectedShiftKey
+                )
                 LocationEligibilityResult.Eligible
             } else {
+                _serverConfirmedWorkingSession.value = null
+                stopRealtimeOrdersListener()
                 LocationEligibilityResult.Ineligible("server_not_working_for_active_shift")
             }
         }
@@ -3012,20 +3308,24 @@ class CaptainRepository(
             lastLocationUploadTimestamp = lastServerLocationTimestamp
         }
         val serverIsOnline = serverCaptain.getBoolean("isOnline") == true
-        val serverPresenceStatus = serverCaptain.getString("presenceStatus")?.trim()?.lowercase().orEmpty()
         val strictEligible = serverCaptain.exists() &&
             serverIsOnline &&
             serverCaptain.getString("workStatus") == "working" &&
             serverCaptain.getBoolean("readyConfirmed") == true &&
             serverCaptain.getString("readyShiftKey") == expectedShiftKey &&
             serverCaptain.getString("workingShiftKey") == expectedShiftKey
-        val directFallbackEligible = serverCaptain.exists() &&
-            serverIsOnline &&
-            directWorkingFallbackKey == "${user.uid}|$expectedShiftKey" &&
-            (serverPresenceStatus == "working" || serverPresenceStatus == "on_trip")
-        return if (strictEligible || directFallbackEligible) {
+        return if (strictEligible) {
+            _serverConfirmedWorkingSession.value = ServerConfirmedWorkingSession(
+                uid = user.uid,
+                workStatus = "working",
+                readyConfirmed = true,
+                readyShiftKey = expectedShiftKey,
+                workingShiftKey = expectedShiftKey
+            )
             LocationEligibilityResult.Eligible
         } else {
+            _serverConfirmedWorkingSession.value = null
+            stopRealtimeOrdersListener()
             LocationEligibilityResult.Ineligible("server_not_working_for_active_shift")
         }
     }
@@ -3142,26 +3442,14 @@ class CaptainRepository(
         }
 
         return withContext(Dispatchers.IO) {
-            val primaryError = if (presenceCallableUnavailable) {
-                null
-            } else {
-                try {
-                    withTimeout(PRESENCE_CALLABLE_TIMEOUT_MS) {
-                        FirebaseFunctions.getInstance()
-                            .getHttpsCallable("updateCaptainShiftPresence")
-                            .call(mapOf("action" to "offline"))
-                            .await()
-                    }
-                    pendingOfflineServerSync = false
-                    return@withContext true
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (e: Exception) {
-                    if (isPresenceCallableNotDeployed(e)) {
-                        presenceCallableUnavailable = true
-                    }
-                    e
-                }
+            val primaryError = try {
+                invokeShiftPresenceCallable("offline")
+                pendingOfflineServerSync = false
+                return@withContext true
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                e
             }
             try {
                 withTimeout(FIRESTORE_OFFLINE_FALLBACK_TIMEOUT_MS) {
@@ -3174,15 +3462,15 @@ class CaptainRepository(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (fallbackErr: Exception) {
-                Log.w("CaptainRepository", "Deferred offline sync retry failed: ${fallbackErr.message} (primary: ${primaryError?.message ?: "callable_unavailable"})")
+                Log.w("CaptainRepository", "Deferred offline sync retry failed: ${fallbackErr.message} (primary: ${primaryError.message})")
                 false
             }
         }
     }
 
     suspend fun markCaptainOfflineInFirestore() {
-        directWorkingFallbackKey = null
-        directReadyFallbackKey = null
+        _serverConfirmedWorkingSession.value = null
+        stopRealtimeOrdersListener()
         val uid = resolveCurrentCaptainUid() ?: return
         val offlinePayload = mapOf<String, Any>(
             "isOnline" to false,
@@ -3190,7 +3478,7 @@ class CaptainRepository(
             "availabilityStatus" to "offline",
             "updatedAt" to FieldValue.serverTimestamp()
         )
-        if (hasTestBackendOverride) {
+        if (hasTestBackendOverride && presenceCallableOverride == null) {
             if (authBackendOverride != null) {
                 try {
                     authBackendOverride.updateCaptainDoc(uid, offlinePayload)
@@ -3208,26 +3496,14 @@ class CaptainRepository(
         }
 
         withContext(NonCancellable + Dispatchers.IO) {
-            val primaryError = if (presenceCallableUnavailable) {
-                null
-            } else {
-                try {
-                    withTimeout(PRESENCE_CALLABLE_TIMEOUT_MS) {
-                        FirebaseFunctions.getInstance()
-                            .getHttpsCallable("updateCaptainShiftPresence")
-                            .call(mapOf("action" to "offline"))
-                            .await()
-                    }
-                    pendingOfflineServerSync = false
-                    return@withContext
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (e: Exception) {
-                    if (isPresenceCallableNotDeployed(e)) {
-                        presenceCallableUnavailable = true
-                    }
-                    e
-                }
+            val primaryError = try {
+                invokeShiftPresenceCallable("offline")
+                pendingOfflineServerSync = false
+                return@withContext
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                e
             }
             // Firestore rules allow only the fail-closed offline presence fallback from the client.
             val fallbackSucceeded = try {
@@ -3243,7 +3519,7 @@ class CaptainRepository(
                 false
             }
             pendingOfflineServerSync = !fallbackSucceeded
-            Log.w("CaptainRepository", "Server offline transition fallback used (succeeded=$fallbackSucceeded): ${primaryError?.message ?: "callable_unavailable"}")
+            Log.w("CaptainRepository", "Server offline transition fallback used (succeeded=$fallbackSucceeded): ${primaryError.message}")
         }
     }
 
@@ -3254,24 +3530,47 @@ class CaptainRepository(
 
     suspend fun setOnlineStatus(isOnline: Boolean) {
         if (isOnline) {
-            if (_accountApprovalState.value != null && !isCurrentSessionApproved) {
+            val wasLocallyOnline = captainDao.getCaptain()?.isOnline == true
+            val uid = resolveCurrentCaptainUid()
+            if (uid.isNullOrBlank()) {
                 captainDao.updateOnlineStatus(false)
-                return
+                throw CaptainPresenceException(
+                    reason = PresenceErrorReason.UNAUTHENTICATED,
+                    userMessage = "انتهت صلاحية الجلسة. يرجى إعادة تسجيل الدخول ثم المحاولة مرة أخرى."
+                )
+            }
+            if (_accountApprovalState.value != null && !isCurrentSessionApproved) {
+                _serverConfirmedWorkingSession.value = null
+                stopRealtimeOrdersListener()
+                captainDao.updateOnlineStatus(false)
+                throw CaptainPresenceException(
+                    reason = PresenceErrorReason.PERMISSION_DENIED,
+                    userMessage = "لا تملك صلاحية تفعيل العمل حالياً. تأكد من اعتماد حسابك من الإدارة."
+                )
             }
             val activeShift = ShiftManager.calculateShiftStatus(getShifts()) as? ShiftStatus.Active
             if (activeShift == null) {
+                _serverConfirmedWorkingSession.value = null
+                stopRealtimeOrdersListener()
                 captainDao.updateOnlineStatus(false)
-                return
+                throw CaptainPresenceException(
+                    reason = PresenceErrorReason.FAILED_PRECONDITION,
+                    userMessage = "لا يمكنك تفعيل العمل خارج وقت الشفت المعتمد."
+                )
             }
             val expectedShiftKey = buildShiftInstanceKey(activeShift.shift)
-            if (hasTestBackendOverride) {
+
+            if (hasTestBackendOverride && presenceCallableOverride == null) {
                 if (authBackendOverride != null) {
-                    val uid = resolveCurrentCaptainUid() ?: return
                     try {
                         authBackendOverride.updateCaptainDoc(
                             uid,
                             mapOf(
                                 "isOnline" to true,
+                                "workStatus" to "working",
+                                "readyConfirmed" to true,
+                                "readyShiftKey" to expectedShiftKey,
+                                "workingShiftKey" to expectedShiftKey,
                                 "presenceStatus" to "working",
                                 "availabilityStatus" to "working",
                                 "updatedAt" to FieldValue.serverTimestamp()
@@ -3282,10 +3581,13 @@ class CaptainRepository(
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (e: Exception) {
-                        if (isConfirmedPresenceRejection(e)) {
+                        if (isConfirmedPresenceRejection(e) || !wasLocallyOnline) {
+                            _serverConfirmedWorkingSession.value = null
+                            stopRealtimeOrdersListener()
                             captainDao.updateOnlineStatus(false)
                         }
                         Log.e("CaptainRepository", "Test backend working-state transition failed", e)
+                        throw e
                     }
                 } else {
                     pendingOfflineServerSync = false
@@ -3294,78 +3596,24 @@ class CaptainRepository(
                 return
             }
 
-            val uid = resolveCurrentCaptainUid() ?: return
-            val fullWorkingPayload = mapOf<String, Any>(
-                "isOnline" to true,
-                "workStatus" to "working",
-                "readyConfirmed" to true,
-                "readyShiftKey" to expectedShiftKey,
-                "workingShiftKey" to expectedShiftKey,
-                "presenceStatus" to "working",
-                "availabilityStatus" to "working",
-                "updatedAt" to FieldValue.serverTimestamp()
-            )
-            val minimalWorkingPayload = mapOf<String, Any>(
-                "isOnline" to true,
-                "presenceStatus" to "working",
-                "availabilityStatus" to "working",
-                "updatedAt" to FieldValue.serverTimestamp()
-            )
-
             try {
-                if (presenceCallableUnavailable) {
-                    updateCaptainPresenceDirectInFirestore(
-                        uid = uid,
-                        fullPayload = fullWorkingPayload,
-                        minimalPayload = minimalWorkingPayload,
-                        fallbackKey = "$uid|$expectedShiftKey",
-                        isWorking = true
-                    )
-                } else {
-                    withContext(Dispatchers.IO) {
-                        withTimeout(PRESENCE_CALLABLE_TIMEOUT_MS) {
-                            FirebaseFunctions.getInstance()
-                                .getHttpsCallable("updateCaptainShiftPresence")
-                                .call(mapOf("action" to "working"))
-                                .await()
-                        }
-                    }
-                }
+                invokeShiftPresenceCallable("working")
                 pendingOfflineServerSync = false
                 captainDao.updateOnlineStatus(true)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (e: Exception) {
-                if (isPresenceCallableNotDeployed(e)) {
-                    presenceCallableUnavailable = true
-                    Log.w("CaptainRepository", "updateCaptainShiftPresence not deployed (${e.message}); falling back to direct Firestore working update")
-                    try {
-                        updateCaptainPresenceDirectInFirestore(
-                            uid = uid,
-                            fullPayload = fullWorkingPayload,
-                            minimalPayload = minimalWorkingPayload,
-                            fallbackKey = "$uid|$expectedShiftKey",
-                            isWorking = true
-                        )
-                        pendingOfflineServerSync = false
-                        captainDao.updateOnlineStatus(true)
-                        return
-                    } catch (cancelled: CancellationException) {
-                        throw cancelled
-                    } catch (fallbackErr: Exception) {
-                        Log.e("CaptainRepository", "Direct Firestore working fallback failed", fallbackErr)
-                        return
-                    }
-                }
-                if (isConfirmedPresenceRejection(e)) {
+                if (isConfirmedPresenceRejection(e) || !wasLocallyOnline) {
+                    _serverConfirmedWorkingSession.value = null
+                    stopRealtimeOrdersListener()
                     captainDao.updateOnlineStatus(false)
                 }
                 Log.e("CaptainRepository", "Server rejected or failed working-state transition", e)
-                return
+                throw e
             }
         } else {
-            directWorkingFallbackKey = null
-            directReadyFallbackKey = null
+            _serverConfirmedWorkingSession.value = null
+            stopRealtimeOrdersListener()
             captainDao.updateOnlineStatus(false)
             orderDao.deleteAllPendingOrders()
             context?.let { CaptainNotificationManager.stopIncomingOrderBell(it) }
@@ -3375,20 +3623,13 @@ class CaptainRepository(
                 return
             }
 
-            val offlinePayload = mapOf<String, Any>(
-                "isOnline" to false,
-                "workStatus" to "offline",
-                "presenceStatus" to "offline",
-                "availabilityStatus" to "offline",
-                "updatedAt" to FieldValue.serverTimestamp()
-            )
             val minimalOfflinePayload = mapOf<String, Any>(
                 "isOnline" to false,
                 "presenceStatus" to "offline",
                 "availabilityStatus" to "offline",
                 "updatedAt" to FieldValue.serverTimestamp()
             )
-            if (hasTestBackendOverride) {
+            if (hasTestBackendOverride && presenceCallableOverride == null) {
                 if (authBackendOverride != null) {
                     try {
                         authBackendOverride.updateCaptainDoc(uid, minimalOfflinePayload)
@@ -3406,71 +3647,70 @@ class CaptainRepository(
             }
 
             withContext(Dispatchers.IO) {
-                val callableError = if (presenceCallableUnavailable) {
-                    null
-                } else {
-                    try {
-                        withTimeout(PRESENCE_CALLABLE_TIMEOUT_MS) {
-                            FirebaseFunctions.getInstance()
-                                .getHttpsCallable("updateCaptainShiftPresence")
-                                .call(mapOf("action" to "offline"))
-                                .await()
-                        }
-                        pendingOfflineServerSync = false
-                        return@withContext
-                    } catch (cancelled: CancellationException) {
-                        throw cancelled
-                    } catch (e: Exception) {
-                        if (isPresenceCallableNotDeployed(e)) {
-                            presenceCallableUnavailable = true
-                        }
-                        e
-                    }
+                val callableError = try {
+                    invokeShiftPresenceCallable("offline")
+                    pendingOfflineServerSync = false
+                    return@withContext
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (e: Exception) {
+                    e
                 }
-                // Fail closed locally even if the callable is not deployed or temporarily unreachable.
+                // Fail closed locally even if the callable is temporarily unreachable.
                 val fallbackSucceeded = try {
                     withTimeout(FIRESTORE_OFFLINE_FALLBACK_TIMEOUT_MS) {
                         firestore.collection("captains").document(uid)
-                            .update(offlinePayload)
+                            .update(minimalOfflinePayload)
                             .await()
                     }
                     true
                 } catch (cancelled: CancellationException) {
                     throw cancelled
-                } catch (e: FirebaseFirestoreException) {
-                    if (e.code == FirebaseFirestoreException.Code.PERMISSION_DENIED) {
-                        try {
-                            withTimeout(FIRESTORE_OFFLINE_FALLBACK_TIMEOUT_MS) {
-                                firestore.collection("captains").document(uid)
-                                    .update(minimalOfflinePayload)
-                                    .await()
-                            }
-                            true
-                        } catch (cancelled: CancellationException) {
-                            throw cancelled
-                        } catch (_: Exception) {
-                            false
-                        }
-                    } else {
-                        false
-                    }
                 } catch (_: Exception) {
                     false
                 }
                 pendingOfflineServerSync = !fallbackSucceeded
-                Log.w("CaptainRepository", "Server offline transition fallback used (succeeded=$fallbackSucceeded): ${callableError?.message ?: "callable_unavailable"}")
+                Log.w("CaptainRepository", "Server offline transition fallback used (succeeded=$fallbackSucceeded): ${callableError.message}")
             }
         }
     }
 
     /** Records the captain's explicit confirmation during the 30-minute pre-shift window. */
     suspend fun setCaptainReadyStatus(ready: Boolean) {
-        if (ready && (_accountApprovalState.value != null && !isCurrentSessionApproved)) return
+        val wasLocallyOnline = captainDao.getCaptain()?.isOnline == true
+        val uid = resolveCurrentCaptainUid()
+        if (uid.isNullOrBlank()) {
+            if (ready) {
+                captainDao.updateOnlineStatus(false)
+                throw CaptainPresenceException(
+                    reason = PresenceErrorReason.UNAUTHENTICATED,
+                    userMessage = "انتهت صلاحية الجلسة. يرجى إعادة تسجيل الدخول ثم المحاولة مرة أخرى."
+                )
+            }
+            captainDao.updateOnlineStatus(false)
+            orderDao.deleteAllPendingOrders()
+            context?.let { CaptainNotificationManager.stopIncomingOrderBell(it) }
+            pendingOfflineServerSync = false
+            return
+        }
+        if (ready && (_accountApprovalState.value != null && !isCurrentSessionApproved)) {
+            captainDao.updateOnlineStatus(false)
+            throw CaptainPresenceException(
+                reason = PresenceErrorReason.PERMISSION_DENIED,
+                userMessage = "لا تملك صلاحية تأكيد الجاهزية حالياً. تأكد من اعتماد حسابك من الإدارة."
+            )
+        }
         val status = ShiftManager.calculateShiftStatus(getShifts())
         val inReadyWindow = status is ShiftStatus.UpcomingSoon &&
             status.millisUntilStart in 1L..(30L * 60_000L)
         val activeNow = status is ShiftStatus.Active
-        if (ready && !inReadyWindow && !activeNow) return
+        if (ready && !inReadyWindow && !activeNow) {
+            captainDao.updateOnlineStatus(false)
+            throw CaptainPresenceException(
+                reason = PresenceErrorReason.FAILED_PRECONDITION,
+                userMessage = "زر جاهز متاح فقط قبل بداية الشفت بـ30 دقيقة أو أثناء الشفت النشط."
+            )
+        }
         val targetShift = when (status) {
             is ShiftStatus.Active -> status.shift
             is ShiftStatus.UpcomingSoon -> status.shift
@@ -3478,14 +3718,6 @@ class CaptainRepository(
         }
         val expectedShiftKey = targetShift?.let { buildShiftInstanceKey(it) }.orEmpty()
 
-        val uid = resolveCurrentCaptainUid() ?: return
-        val offlinePayload = mapOf<String, Any>(
-            "isOnline" to false,
-            "workStatus" to "offline",
-            "presenceStatus" to "offline",
-            "availabilityStatus" to "offline",
-            "updatedAt" to FieldValue.serverTimestamp()
-        )
         val minimalOfflinePayload = mapOf<String, Any>(
             "isOnline" to false,
             "presenceStatus" to "offline",
@@ -3493,12 +3725,7 @@ class CaptainRepository(
             "updatedAt" to FieldValue.serverTimestamp()
         )
 
-        if (!ready) {
-            directReadyFallbackKey = null
-            directWorkingFallbackKey = null
-        }
-
-        if (hasTestBackendOverride) {
+        if (hasTestBackendOverride && presenceCallableOverride == null) {
             if (authBackendOverride != null) {
                 try {
                     val payload = if (ready) {
@@ -3506,6 +3733,7 @@ class CaptainRepository(
                             "isOnline" to true,
                             "workStatus" to "ready",
                             "readyConfirmed" to true,
+                            "readyShiftKey" to expectedShiftKey,
                             "presenceStatus" to "ready",
                             "availabilityStatus" to "ready",
                             "updatedAt" to FieldValue.serverTimestamp()
@@ -3517,6 +3745,8 @@ class CaptainRepository(
                     pendingOfflineServerSync = false
                     captainDao.updateOnlineStatus(ready)
                     if (!ready) {
+                        _serverConfirmedWorkingSession.value = null
+                        stopRealtimeOrdersListener()
                         orderDao.deleteAllPendingOrders()
                         context?.let { CaptainNotificationManager.stopIncomingOrderBell(it) }
                     }
@@ -3524,9 +3754,15 @@ class CaptainRepository(
                     throw cancelled
                 } catch (e: Exception) {
                     if (!ready) {
+                        _serverConfirmedWorkingSession.value = null
+                        stopRealtimeOrdersListener()
                         captainDao.updateOnlineStatus(false)
+                        orderDao.deleteAllPendingOrders()
+                        context?.let { CaptainNotificationManager.stopIncomingOrderBell(it) }
                         pendingOfflineServerSync = true
-                    } else if (isConfirmedPresenceRejection(e)) {
+                    } else if (isConfirmedPresenceRejection(e) || !wasLocallyOnline) {
+                        _serverConfirmedWorkingSession.value = null
+                        stopRealtimeOrdersListener()
                         captainDao.updateOnlineStatus(false)
                     }
                     throw e
@@ -3535,6 +3771,8 @@ class CaptainRepository(
                 pendingOfflineServerSync = false
                 captainDao.updateOnlineStatus(ready)
                 if (!ready) {
+                    _serverConfirmedWorkingSession.value = null
+                    stopRealtimeOrdersListener()
                     orderDao.deleteAllPendingOrders()
                     context?.let { CaptainNotificationManager.stopIncomingOrderBell(it) }
                 }
@@ -3542,96 +3780,22 @@ class CaptainRepository(
             return
         }
 
-        val fullReadyPayload = mapOf<String, Any>(
-            "isOnline" to true,
-            "workStatus" to "ready",
-            "readyConfirmed" to true,
-            "readyShiftKey" to expectedShiftKey,
-            "presenceStatus" to "ready",
-            "availabilityStatus" to "ready",
-            "updatedAt" to FieldValue.serverTimestamp()
-        )
-        val minimalReadyPayload = mapOf<String, Any>(
-            "isOnline" to true,
-            "presenceStatus" to "ready",
-            "availabilityStatus" to "ready",
-            "updatedAt" to FieldValue.serverTimestamp()
-        )
-
         try {
-            if (presenceCallableUnavailable) {
-                if (ready) {
-                    updateCaptainPresenceDirectInFirestore(
-                        uid = uid,
-                        fullPayload = fullReadyPayload,
-                        minimalPayload = minimalReadyPayload,
-                        fallbackKey = "$uid|$expectedShiftKey",
-                        isWorking = false
-                    )
-                } else {
-                    updateCaptainPresenceDirectInFirestore(
-                        uid = uid,
-                        fullPayload = offlinePayload,
-                        minimalPayload = minimalOfflinePayload,
-                        fallbackKey = "",
-                        isWorking = false
-                    )
-                }
-            } else {
-                withContext(Dispatchers.IO) {
-                    withTimeout(PRESENCE_CALLABLE_TIMEOUT_MS) {
-                        FirebaseFunctions.getInstance()
-                            .getHttpsCallable("updateCaptainShiftPresence")
-                            .call(mapOf("action" to if (ready) "ready" else "offline"))
-                            .await()
-                    }
-                }
-            }
+            invokeShiftPresenceCallable(if (ready) "ready" else "offline")
             pendingOfflineServerSync = false
             captainDao.updateOnlineStatus(ready)
             if (!ready) {
+                _serverConfirmedWorkingSession.value = null
+                stopRealtimeOrdersListener()
                 orderDao.deleteAllPendingOrders()
                 context?.let { CaptainNotificationManager.stopIncomingOrderBell(it) }
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: Exception) {
-            if (isPresenceCallableNotDeployed(e)) {
-                presenceCallableUnavailable = true
-                Log.w("CaptainRepository", "updateCaptainShiftPresence not deployed (${e.message}); falling back to direct Firestore readiness update")
-                try {
-                    if (ready) {
-                        updateCaptainPresenceDirectInFirestore(
-                            uid = uid,
-                            fullPayload = fullReadyPayload,
-                            minimalPayload = minimalReadyPayload,
-                            fallbackKey = "$uid|$expectedShiftKey",
-                            isWorking = false
-                        )
-                    } else {
-                        updateCaptainPresenceDirectInFirestore(
-                            uid = uid,
-                            fullPayload = offlinePayload,
-                            minimalPayload = minimalOfflinePayload,
-                            fallbackKey = "",
-                            isWorking = false
-                        )
-                    }
-                    pendingOfflineServerSync = false
-                    captainDao.updateOnlineStatus(ready)
-                    if (!ready) {
-                        orderDao.deleteAllPendingOrders()
-                        context?.let { CaptainNotificationManager.stopIncomingOrderBell(it) }
-                    }
-                    return
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (fallbackErr: Exception) {
-                    Log.e("CaptainRepository", "Direct Firestore readiness fallback failed", fallbackErr)
-                    throw fallbackErr
-                }
-            }
             if (!ready) {
+                _serverConfirmedWorkingSession.value = null
+                stopRealtimeOrdersListener()
                 captainDao.updateOnlineStatus(false)
                 orderDao.deleteAllPendingOrders()
                 context?.let { CaptainNotificationManager.stopIncomingOrderBell(it) }
@@ -3650,7 +3814,9 @@ class CaptainRepository(
                     }
                 }
                 pendingOfflineServerSync = !fallbackSucceeded
-            } else if (isConfirmedPresenceRejection(e)) {
+            } else if (isConfirmedPresenceRejection(e) || !wasLocallyOnline) {
+                _serverConfirmedWorkingSession.value = null
+                stopRealtimeOrdersListener()
                 captainDao.updateOnlineStatus(false)
             }
             Log.e("CaptainRepository", "Unable to update server-confirmed captain readiness", e)
@@ -3663,6 +3829,7 @@ class CaptainRepository(
         val uid = resolveCurrentCaptainUid()
 
         _accountApprovalState.value = null
+        _serverConfirmedWorkingSession.value = null
         stopRealtimeShiftListener()
         stopRealtimeOrdersListener()
         context?.let { ctx ->
@@ -3704,18 +3871,12 @@ class CaptainRepository(
                 }
             } else {
                 withContext(NonCancellable + Dispatchers.IO) {
-                    if (!presenceCallableUnavailable) {
-                        runCatching {
-                            withTimeoutOrNull(LOGOUT_NETWORK_TIMEOUT_MS) {
-                                FirebaseFunctions.getInstance()
-                                    .getHttpsCallable("updateCaptainShiftPresence")
-                                    .call(mapOf("action" to "offline"))
-                                    .await()
-                            }
-                        }.onFailure { err ->
-                            if (isPresenceCallableNotDeployed(err)) {
-                                presenceCallableUnavailable = true
-                            }
+                    runCatching {
+                        withTimeoutOrNull(LOGOUT_NETWORK_TIMEOUT_MS) {
+                            presenceFunctions()
+                                .getHttpsCallable("updateCaptainShiftPresence")
+                                .call(mapOf("action" to "offline"))
+                                .await()
                         }
                     }
                     runCatching {
@@ -3749,8 +3910,6 @@ class CaptainRepository(
             }
         }
 
-        directWorkingFallbackKey = null
-        directReadyFallbackKey = null
         lastSyncedFcmUid = null
         lastSyncedFcmToken = null
         pendingOfflineServerSync = false
@@ -3841,7 +4000,7 @@ class CaptainRepository(
             licensePlate = licensePlate.trim(),
             rating = 5.0f,
             walletBalance = 0.0,
-            isOnline = true,
+            isOnline = false,
             isLoggedIn = true,
             accountType = "captain",
             role = "captain",
@@ -4213,22 +4372,10 @@ class CaptainRepository(
         @Volatile
         private var lastSyncedFcmToken: String? = null
 
-        @Volatile
-        internal var presenceCallableUnavailable: Boolean = false
-
-        @Volatile
-        internal var directWorkingFallbackKey: String? = null
-
-        @Volatile
-        internal var directReadyFallbackKey: String? = null
-
         internal fun resetPresenceFallbackStateForTesting() {
             fcmTokenHardFailureDetected = false
             lastSyncedFcmUid = null
             lastSyncedFcmToken = null
-            presenceCallableUnavailable = false
-            directWorkingFallbackKey = null
-            directReadyFallbackKey = null
         }
 
         /**

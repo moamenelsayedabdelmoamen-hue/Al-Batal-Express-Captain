@@ -154,3 +154,11 @@ dependencies {
   "ksp"(libs.androidx.room.compiler)
   // "ksp"(libs.moshi.kotlin.codegen)
 }
+
+// Guard against AGP incremental DexMergingTask dropping modified project DEX buckets (e.g. MainActivity).
+tasks.configureEach {
+  if (name.startsWith("mergeProjectDex")) {
+    outputs.cacheIf { false }
+    outputs.upToDateWhen { false }
+  }
+}

@@ -249,10 +249,15 @@ class CaptainPresenceAndLogoutTest {
         assertEquals(true, backend.docs["cap_pres_1"]?.get("isOnline"))
         assertEquals("working", backend.docs["cap_pres_1"]?.get("presenceStatus"))
 
-        // 2. Transient network failure during setOnlineStatus(true) MUST NOT force an online captain offline
+        // 2. Transient network failure during setOnlineStatus(true) MUST propagate error AND MUST NOT force an online captain offline
         backend.updateFailure = IOException("Temporary network drop")
-        repo.setOnlineStatus(true)
-        assertTrue("Transient network error must not flip captain to offline", db.captainDao().getCaptain()?.isOnline == true)
+        try {
+            repo.setOnlineStatus(true)
+            fail("Expected IOException to propagate from setOnlineStatus(true)")
+        } catch (_: IOException) {
+            // Expected per PR #14: never swallow errors silently
+        }
+        assertTrue("Transient network error must not flip already-online captain to offline", db.captainDao().getCaptain()?.isOnline == true)
 
         // 3. CancellationException must propagate instead of being swallowed
         backend.updateFailure = CancellationException("Coroutine cancelled")

@@ -602,7 +602,8 @@ class CaptainAuthAndIsolationTest {
         val alarmShadow = Shadows.shadowOf(appContext.getSystemService(Context.ALARM_SERVICE) as android.app.AlarmManager)
         assertTrue("Shift alarms must be scheduled", alarmShadow.scheduledAlarms.isNotEmpty())
 
-        // 3. Verify order acceptance works when online + inside active shift, and blocked when offline
+        // 3. Verify login starts offline, then activating shift presence enables order acceptance
+        assertFalse("Captain must start offline after login before confirming shift presence", db.captainDao().getCaptain()?.isOnline == true)
         val testOrder = OrderEntity(
             id = 888L,
             orderNumber = "EXP-888",
@@ -622,7 +623,14 @@ class CaptainAuthAndIsolationTest {
         )
         db.orderDao().insertOrder(testOrder)
 
-        // Online + inside shift -> acceptOrder succeeds
+        assertTrue("Offline captain after login must be blocked from accepting orders", repo.acceptOrder(888L).isFailure)
+
+        // Activate shift presence (ready -> working -> server verification) inside active shift
+        repo.setCaptainReadyStatus(true)
+        repo.setOnlineStatus(true)
+        assertEquals(com.example.data.LocationEligibilityResult.Eligible, repo.checkLocationTrackingEligibility())
+
+        // Online + confirmed working inside shift -> acceptOrder succeeds
         val acceptOk = repo.acceptOrder(888L)
         assertTrue("Verified active captain inside shift & online must accept order", acceptOk.isSuccess)
         assertEquals(OrderStatus.ACCEPTED, repo.allOrdersFlow.first().firstOrNull { it.id == 888L }?.status)
