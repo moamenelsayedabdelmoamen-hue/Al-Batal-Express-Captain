@@ -11,13 +11,10 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -48,6 +45,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -792,22 +790,20 @@ fun DashboardScreen(
                     }
                 }
             } else {
-                // List of available trip cards
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 480.dp)
+                // Render available trip cards directly inside the parent verticalScroll Column
+                // (avoids nested LazyColumn scroll conflicts and subcomposition overhead).
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    items(
-                        items = availableOrders,
-                        key = { availableOrder -> availableOrder.id }
-                    ) { availableOrder ->
-                        AvailableTripCard(
-                            order = availableOrder,
-                            isLoading = isLoading,
-                            onAcceptOrder = onAcceptOrder
-                        )
-                        Spacer(modifier = Modifier.height(12.dp))
+                    availableOrders.forEach { availableOrder ->
+                        key(availableOrder.id) {
+                            AvailableTripCard(
+                                order = availableOrder,
+                                isLoading = isLoading,
+                                onAcceptOrder = onAcceptOrder
+                            )
+                        }
                     }
                 }
             }

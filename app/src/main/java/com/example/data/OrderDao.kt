@@ -13,8 +13,17 @@ interface OrderDao {
     @Query("SELECT * FROM orders ORDER BY createdAt DESC")
     fun getAllOrdersFlow(): Flow<List<OrderEntity>>
 
+    @Query("SELECT * FROM orders ORDER BY createdAt DESC")
+    suspend fun getAllOrdersSnapshot(): List<OrderEntity>
+
+    @Query("SELECT * FROM orders WHERE id = :orderId LIMIT 1")
+    suspend fun getOrderById(orderId: Long): OrderEntity?
+
     @Query("SELECT * FROM orders WHERE firestoreDocId = :firestoreDocId LIMIT 1")
     suspend fun findByFirestoreDocId(firestoreDocId: String): OrderEntity?
+
+    @Query("SELECT * FROM orders WHERE firestoreDocId IN (:firestoreDocIds)")
+    suspend fun findByFirestoreDocIds(firestoreDocIds: List<String>): List<OrderEntity>
 
     @Query("""
         SELECT * FROM orders
@@ -39,66 +48,75 @@ interface OrderDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertOrder(order: OrderEntity): Long
 
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertOrders(orders: List<OrderEntity>): List<Long>
+
     @Transaction
     suspend fun upsertByFirestoreId(order: OrderEntity): Long {
         if (order.firestoreDocId.isNotBlank()) {
             val existing = findByFirestoreDocId(order.firestoreDocId)
             if (existing != null) {
-                if (existing.status == OrderStatus.EXPIRED &&
-                    order.status == OrderStatus.PENDING &&
-                    (order.offerExpiresAt <= 0L || order.offerExpiresAt <= existing.offerExpiresAt)
-                ) {
-                    return existing.id
-                }
-                val mergedOrderCode = order.orderCode.ifBlank { existing.orderCode }
-                val mergedOfferExpiresAt = if (order.offerExpiresAt > 0L) order.offerExpiresAt else existing.offerExpiresAt
-                val mergedMerchantId = order.merchantId.ifBlank { existing.merchantId }
-                val mergedStoreLocationUrl = order.storeLocationUrl.ifBlank { existing.storeLocationUrl }
-                val incomingCoordsValid = order.restaurantLatitude != null &&
-                    order.restaurantLongitude != null &&
-                    order.restaurantLatitude.isFinite() &&
-                    order.restaurantLongitude.isFinite() &&
-                    !(order.restaurantLatitude == 0.0 && order.restaurantLongitude == 0.0)
-                val mergedLat = if (incomingCoordsValid) order.restaurantLatitude else existing.restaurantLatitude
-                val mergedLng = if (incomingCoordsValid) order.restaurantLongitude else existing.restaurantLongitude
-                val mergedStorePhone = order.storePhone.ifBlank { existing.storePhone }
-                val mergedStoreImage = order.storeImage.ifBlank { existing.storeImage }
-                val mergedCaptainId = order.captainId.ifBlank { existing.captainId }
-                val mergedReceiptImagePath = order.receiptImagePath.ifBlank { existing.receiptImagePath }
-                val mergedOrderImageUrl = order.orderImageUrl.ifBlank { existing.orderImageUrl }
-                val mergedReceiptUploadedAt = if (order.receiptUploadedAt > 0L) order.receiptUploadedAt else existing.receiptUploadedAt
-                val mergedReceiptUploadedBy = order.receiptUploadedBy.ifBlank { existing.receiptUploadedBy }
-                val mergedAcceptedAt = if (order.acceptedAt > 0L) order.acceptedAt else existing.acceptedAt
-                val mergedCompletedAt = if (order.completedAt > 0L) order.completedAt else existing.completedAt
-                val mergedCancelledAt = if (order.cancelledAt > 0L) order.cancelledAt else existing.cancelledAt
-                val mergedCancellationReason = order.cancellationReason.ifBlank { existing.cancellationReason }
-
-                return insertOrder(
-                    order.copy(
-                        id = existing.id,
-                        orderCode = mergedOrderCode,
-                        offerExpiresAt = mergedOfferExpiresAt,
-                        merchantId = mergedMerchantId,
-                        storeLocationUrl = mergedStoreLocationUrl,
-                        restaurantLatitude = mergedLat,
-                        restaurantLongitude = mergedLng,
-                        storePhone = mergedStorePhone,
-                        storeImage = mergedStoreImage,
-                        captainId = mergedCaptainId,
-                        receiptImagePath = mergedReceiptImagePath,
-                        orderImageUrl = mergedOrderImageUrl,
-                        receiptUploadedAt = mergedReceiptUploadedAt,
-                        receiptUploadedBy = mergedReceiptUploadedBy,
-                        acceptedAt = mergedAcceptedAt,
-                        completedAt = mergedCompletedAt,
-                        cancelledAt = mergedCancelledAt,
-                        cancellationReason = mergedCancellationReason
-                    )
-                )
+                val merged = mergeIncomingOrderWithExisting(existing, order) ?: return existing.id
+                return insertOrder(merged)
             }
         }
         return insertOrder(order)
     }
+
+    /**
+     * Bulk upsert inside a single Room @Transaction so syncing N orders fires only ONE
+     * SQLite commit and ONE Room table invalidation instead of N full scans and N emissions.
+     * Preserves all non-blank/valid local fields identically to [upsertByFirestoreId].
+     */
+    @Transaction
+    suspend fun upsertAllByFirestoreIds(orders: List<OrderEntity>): Map<String, Long> {
+        if (orders.isEmpty()) return emptyMap()
+        val distinctDocIds = orders.mapNotNull { it.firestoreDocId.takeIf(String::isNotBlank) }.distinct()
+        val existingByDocId = HashMap<String, OrderEntity>(distinctDocIds.size)
+        for (chunk in distinctDocIds.chunked(450)) {
+            for (row in findByFirestoreDocIds(chunk)) {
+                if (row.firestoreDocId.isNotBlank()) {
+                    existingByDocId[row.firestoreDocId] = row
+                }
+            }
+        }
+
+        val toWrite = ArrayList<OrderEntity>(orders.size)
+        val resultIds = LinkedHashMap<String, Long>(orders.size)
+
+        for (incoming in orders) {
+            val docId = incoming.firestoreDocId
+            if (docId.isNotBlank()) {
+                val existing = existingByDocId[docId]
+                if (existing != null) {
+                    val merged = mergeIncomingOrderWithExisting(existing, incoming)
+                    if (merged == null) {
+                        resultIds[docId] = existing.id
+                    } else {
+                        existingByDocId[docId] = merged
+                        toWrite.add(merged)
+                    }
+                } else {
+                    existingByDocId[docId] = incoming
+                    toWrite.add(incoming)
+                }
+            } else {
+                toWrite.add(incoming)
+            }
+        }
+
+        if (toWrite.isNotEmpty()) {
+            val insertedIds = insertOrders(toWrite)
+            for (i in toWrite.indices) {
+                val key = toWrite[i].firestoreDocId.ifBlank { "id_${insertedIds[i]}" }
+                resultIds[key] = insertedIds[i]
+            }
+        }
+        return resultIds
+    }
+
+    @Query("DELETE FROM orders WHERE id IN (:orderIds)")
+    suspend fun deleteOrdersByIds(orderIds: List<Long>)
 
     @Update
     suspend fun updateOrder(order: OrderEntity)
@@ -176,4 +194,59 @@ interface OrderDao {
 
     @Query("SELECT SUM(deliveryFee) FROM orders WHERE status = 'DELIVERED'")
     fun getTotalEarningsFlow(): Flow<Double?>
+}
+
+internal fun mergeIncomingOrderWithExisting(
+    existing: OrderEntity,
+    order: OrderEntity
+): OrderEntity? {
+    if (existing.status == OrderStatus.EXPIRED &&
+        order.status == OrderStatus.PENDING &&
+        (order.offerExpiresAt <= 0L || order.offerExpiresAt <= existing.offerExpiresAt)
+    ) {
+        return null
+    }
+    val mergedOrderCode = order.orderCode.ifBlank { existing.orderCode }
+    val mergedOfferExpiresAt = if (order.offerExpiresAt > 0L) order.offerExpiresAt else existing.offerExpiresAt
+    val mergedMerchantId = order.merchantId.ifBlank { existing.merchantId }
+    val mergedStoreLocationUrl = order.storeLocationUrl.ifBlank { existing.storeLocationUrl }
+    val incomingCoordsValid = order.restaurantLatitude != null &&
+        order.restaurantLongitude != null &&
+        order.restaurantLatitude.isFinite() &&
+        order.restaurantLongitude.isFinite() &&
+        !(order.restaurantLatitude == 0.0 && order.restaurantLongitude == 0.0)
+    val mergedLat = if (incomingCoordsValid) order.restaurantLatitude else existing.restaurantLatitude
+    val mergedLng = if (incomingCoordsValid) order.restaurantLongitude else existing.restaurantLongitude
+    val mergedStorePhone = order.storePhone.ifBlank { existing.storePhone }
+    val mergedStoreImage = order.storeImage.ifBlank { existing.storeImage }
+    val mergedCaptainId = order.captainId.ifBlank { existing.captainId }
+    val mergedReceiptImagePath = order.receiptImagePath.ifBlank { existing.receiptImagePath }
+    val mergedOrderImageUrl = order.orderImageUrl.ifBlank { existing.orderImageUrl }
+    val mergedReceiptUploadedAt = if (order.receiptUploadedAt > 0L) order.receiptUploadedAt else existing.receiptUploadedAt
+    val mergedReceiptUploadedBy = order.receiptUploadedBy.ifBlank { existing.receiptUploadedBy }
+    val mergedAcceptedAt = if (order.acceptedAt > 0L) order.acceptedAt else existing.acceptedAt
+    val mergedCompletedAt = if (order.completedAt > 0L) order.completedAt else existing.completedAt
+    val mergedCancelledAt = if (order.cancelledAt > 0L) order.cancelledAt else existing.cancelledAt
+    val mergedCancellationReason = order.cancellationReason.ifBlank { existing.cancellationReason }
+
+    return order.copy(
+        id = existing.id,
+        orderCode = mergedOrderCode,
+        offerExpiresAt = mergedOfferExpiresAt,
+        merchantId = mergedMerchantId,
+        storeLocationUrl = mergedStoreLocationUrl,
+        restaurantLatitude = mergedLat,
+        restaurantLongitude = mergedLng,
+        storePhone = mergedStorePhone,
+        storeImage = mergedStoreImage,
+        captainId = mergedCaptainId,
+        receiptImagePath = mergedReceiptImagePath,
+        orderImageUrl = mergedOrderImageUrl,
+        receiptUploadedAt = mergedReceiptUploadedAt,
+        receiptUploadedBy = mergedReceiptUploadedBy,
+        acceptedAt = mergedAcceptedAt,
+        completedAt = mergedCompletedAt,
+        cancelledAt = mergedCancelledAt,
+        cancellationReason = mergedCancellationReason
+    )
 }

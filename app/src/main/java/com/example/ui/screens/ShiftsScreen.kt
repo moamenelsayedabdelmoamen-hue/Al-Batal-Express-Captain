@@ -32,6 +32,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -66,28 +67,37 @@ fun ShiftsScreen(
     onRefreshShifts: () -> Unit = {}
 ) {
     val scrollState = rememberScrollState()
-    val todayDayOfWeek = ShiftManager.getCurrentCairoCalendar().get(Calendar.DAY_OF_WEEK)
-
-    // Standard week days in order: Saturday to Friday
-    val standardWeekDays = listOf(
-        Calendar.SATURDAY to "السبت",
-        Calendar.SUNDAY to "الأحد",
-        Calendar.MONDAY to "الإثنين",
-        Calendar.TUESDAY to "الثلاثاء",
-        Calendar.WEDNESDAY to "الأربعاء",
-        Calendar.THURSDAY to "الخميس",
-        Calendar.FRIDAY to "الجمعة"
-    )
-
-    val weekItems = standardWeekDays.map { (dayCode, dayArabic) ->
-        val dayShifts = shifts.filter { it.dayOfWeek == dayCode }
-            .sortedBy { ShiftManager.parseTimeToMinutes(it.startTime) }
-        Triple(dayCode, dayArabic, dayShifts)
+    val todayDayOfWeek = remember(currentCairoDate) {
+        ShiftManager.getCurrentCairoCalendar().get(Calendar.DAY_OF_WEEK)
     }
 
-    val totalHours = ShiftManager.calculateWeeklyWorkHours(shifts)
-    val workingDaysCount = shifts.filter { !it.isDayOff }.map { it.dayOfWeek }.distinct().size
-    val daysOffCount = shifts.filter { it.isDayOff }.map { it.dayOfWeek }.distinct().size
+    // Standard week days in order: Saturday to Friday
+    val standardWeekDays = remember {
+        listOf(
+            Calendar.SATURDAY to "السبت",
+            Calendar.SUNDAY to "الأحد",
+            Calendar.MONDAY to "الإثنين",
+            Calendar.TUESDAY to "الثلاثاء",
+            Calendar.WEDNESDAY to "الأربعاء",
+            Calendar.THURSDAY to "الخميس",
+            Calendar.FRIDAY to "الجمعة"
+        )
+    }
+
+    val weekItems = remember(shifts) {
+        standardWeekDays.map { (dayCode, dayArabic) ->
+            val dayShifts = shifts.filter { it.dayOfWeek == dayCode }
+                .sortedBy { ShiftManager.parseTimeToMinutes(it.startTime) }
+            Triple(dayCode, dayArabic, dayShifts)
+        }
+    }
+
+    val (totalHours, workingDaysCount, daysOffCount) = remember(shifts) {
+        val hours = ShiftManager.calculateWeeklyWorkHours(shifts)
+        val working = shifts.filter { !it.isDayOff }.map { it.dayOfWeek }.distinct().size
+        val off = shifts.filter { it.isDayOff }.map { it.dayOfWeek }.distinct().size
+        Triple(hours, working, off)
+    }
 
     Column(
         modifier = Modifier

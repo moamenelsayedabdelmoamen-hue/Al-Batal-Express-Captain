@@ -6,7 +6,9 @@ import android.net.Uri
 import android.util.Log
 import java.text.SimpleDateFormat
 import java.util.Calendar
+import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import com.example.data.location.GpsConfig
 import com.example.data.remote.CloudFunctionsOrderClient
 import com.google.firebase.FirebaseApp
@@ -16,6 +18,7 @@ import com.google.firebase.auth.FirebaseAuthInvalidCredentialsException
 import com.google.firebase.auth.FirebaseAuthUserCollisionException
 import com.google.firebase.auth.FirebaseAuthWeakPasswordException
 import com.google.firebase.auth.UserProfileChangeRequest
+import com.google.firebase.firestore.DocumentChange
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
@@ -31,24 +34,29 @@ import com.example.data.storage.ImageUploadState
 import com.example.notifications.CaptainNotificationManager
 import com.example.notifications.ShiftNotificationScheduler
 import com.google.firebase.messaging.FirebaseMessaging
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.firstOrNull
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 
 enum class PresenceErrorReason {
     UNAUTHENTICATED,
@@ -175,16 +183,29 @@ interface CaptainAuthBackendPort {
     suspend fun refreshIdToken() {}
 }
 
+internal data class ParsedOrderSnapshot(
+    val docId: String,
+    val order: OrderEntity,
+    val docCaptainId: String,
+    val offeredCaptainId: String,
+    val isExcluded: Boolean,
+    val hasMatchingSecondaryUid: Boolean,
+    val hasMatchingPhone: Boolean
+)
+
 class CaptainRepository(
     val captainDao: CaptainDao,
     val orderDao: OrderDao,
     val shiftDao: ShiftDao? = null,
-    private val context: Context? = null,
-    val storageRepository: FirebaseStorageRepository = FirebaseStorageRepository.getInstance(context),
+    context: Context? = null,
+    val storageRepository: FirebaseStorageRepository = FirebaseStorageRepository.getInstance(context?.applicationContext),
     private val cloudMetadataPortOverride: CaptainCloudMetadataPort? = null,
     private val cloudFunctionsClientOverride: com.example.data.remote.CloudFunctionsOrderClient? = null,
     private val authBackendOverride: CaptainAuthBackendPort? = null
 ) {
+    // Always retain Application Context only — never leak an Activity Context.
+    internal val context: Context? = context?.applicationContext
+
     suspend fun saveShiftsLocally(uid: String, shifts: List<ShiftEntity>) {
         saveShiftsAndScheduleAlarms(uid, shifts)
         _isShiftSynced.value = true
@@ -193,12 +214,13 @@ class CaptainRepository(
     constructor(captainDao: CaptainDao, orderDao: OrderDao, context: Context?) : this(
         captainDao,
         orderDao,
-        context?.let { AppDatabase.getDatabase(it).shiftDao() },
-        context
+        context?.applicationContext?.let { AppDatabase.getDatabase(it).shiftDao() },
+        context?.applicationContext
     )
 
     private val firestore: FirebaseFirestore by lazy { FirebaseFirestore.getInstance() }
     private val firebaseAuth: FirebaseAuth by lazy { FirebaseAuth.getInstance() }
+    private val repositoryScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // Strictly in-memory server-verified approval state (NEVER trusted from Room or SharedPreferences).
     private val _accountApprovalState = MutableStateFlow<CaptainApprovalSnapshot?>(null)
@@ -210,6 +232,31 @@ class CaptainRepository(
         _serverConfirmedWorkingSession.asStateFlow()
 
     private val ordersListenerLock = Any()
+    private val ordersListenerConsumers = mutableSetOf<String>()
+    private val listenerMatchedDocIds = mutableMapOf<String, MutableSet<String>>()
+    private val orderSnapshotMutex = Mutex()
+    private val shiftSyncMutex = Mutex()
+    private val historySyncMutex = Mutex()
+    private val walletReconcileLock = Any()
+    private var walletReconcileJob: Job? = null
+
+    @Volatile
+    private var lastShiftSyncUid: String? = null
+    @Volatile
+    private var lastShiftSyncAtMs: Long = 0L
+
+    @Volatile
+    private var lastFullHistorySyncUid: String? = null
+    @Volatile
+    private var lastFullHistorySyncAtMs: Long = 0L
+    @Volatile
+    private var lastOperationalHistorySyncUid: String? = null
+    @Volatile
+    private var lastOperationalHistorySyncAtMs: Long = 0L
+    @Volatile
+    private var dateBoundedHistoryIndexUnavailable: Boolean = false
+    private val syncedDateKeysCache = ConcurrentHashMap<String, Long>()
+
     @Volatile
     private var activeOrdersListenerUid: String? = null
     @Volatile
@@ -217,9 +264,16 @@ class CaptainRepository(
 
     internal var ordersListenerAttachmentOverride:
         ((uid: String, shiftKey: String) -> List<ListenerRegistration>)? = null
+    internal var archivedOrdersDateSyncOverride:
+        (suspend (uid: String, dateKey: String, forceRefresh: Boolean) -> Result<Int>)? = null
+    internal var walletReconcileDebounceMs: Long = WALLET_RECONCILE_DEBOUNCE_MS
+    internal var onWalletReconciledForTesting: (() -> Unit)? = null
 
     internal val activeOrdersListenerCount: Int
         get() = synchronized(ordersListenerLock) { ordersListenerRegistrations.size }
+
+    internal val activeOrdersListenerConsumerCount: Int
+        get() = synchronized(ordersListenerLock) { ordersListenerConsumers.size }
 
     val isCurrentSessionApproved: Boolean
         get() = _accountApprovalState.value?.canEnterApp == true
@@ -784,7 +838,272 @@ class CaptainRepository(
             confirmed.workingShiftKey == expectedShiftKey
     }
 
-    fun startRealtimeOrdersListener() {
+    private fun DocumentSnapshot.toParsedOrderSnapshot(myUid: String, myPhone: String): ParsedOrderSnapshot? {
+        val order = toOrderEntity() ?: return null
+        val docCaptainId = safeString(
+            "captainId", "captain_id", "driverId", "driver_id",
+            "assignedCaptainId", "assignedDriverId", "captainUid",
+            "driverUid", "assignedCaptainPhone", "driverPhone", "captain_phone"
+        )
+        val offeredCaptainId = safeString("offeredCaptainId", "offered_captain_id")
+        val isExcluded = isExcludedCaptain(myUid)
+        val hasMatchingSecondaryUid = myUid.isNotBlank() &&
+            safeString("captainUid", "driverUid", "offeredCaptainId") == myUid
+        val hasMatchingPhone = myPhone.isNotBlank() && (
+            isSamePhone(docCaptainId, myPhone) ||
+                isSamePhone(safeString("driverPhone", "assignedCaptainPhone"), myPhone)
+            )
+        return ParsedOrderSnapshot(
+            docId = id,
+            order = order,
+            docCaptainId = docCaptainId,
+            offeredCaptainId = offeredCaptainId,
+            isExcluded = isExcluded,
+            hasMatchingSecondaryUid = hasMatchingSecondaryUid,
+            hasMatchingPhone = hasMatchingPhone
+        )
+    }
+
+    internal fun scheduleDailyWalletReconciliation() {
+        synchronized(walletReconcileLock) {
+            walletReconcileJob?.cancel()
+            val delayMs = walletReconcileDebounceMs
+            walletReconcileJob = repositoryScope.launch {
+                if (delayMs > 0L) {
+                    delay(delayMs)
+                }
+                reconcileDailyWallets()
+                onWalletReconciledForTesting?.invoke()
+            }
+        }
+    }
+
+    internal suspend fun applyOrderSnapshotChanges(
+        listenerKey: String,
+        authUid: String,
+        changedOrders: List<ParsedOrderSnapshot>,
+        removedDocIds: List<String> = emptyList()
+    ) = orderSnapshotMutex.withLock {
+        if (changedOrders.isEmpty() && removedDocIds.isEmpty()) return@withLock
+
+        val currentCaptain = captainDao.getCaptain()
+        val myPhone = currentCaptain?.phoneNumber ?: ""
+        val myUid = authUid.ifBlank { currentCaptain?.uid.orEmpty() }
+        val eligibleForNewOrders = isCaptainEligibleForNewOrders(currentCaptain)
+
+        if (!eligibleForNewOrders) {
+            orderDao.deleteAllPendingOrders()
+            context?.let { CaptainNotificationManager.stopIncomingOrderBell(it) }
+        }
+
+        // Update tracked matched doc IDs for this listener
+        val stillMatchedElsewhere = mutableSetOf<String>()
+        synchronized(ordersListenerLock) {
+            val bucket = listenerMatchedDocIds.getOrPut(listenerKey) { mutableSetOf() }
+            for (item in changedOrders) {
+                if (item.docId.isNotBlank()) bucket.add(item.docId)
+            }
+            for (removedId in removedDocIds) {
+                bucket.remove(removedId)
+                val inOtherListener = listenerMatchedDocIds.any { (key, ids) ->
+                    key != listenerKey && ids.contains(removedId)
+                }
+                if (inOtherListener) {
+                    stillMatchedElsewhere.add(removedId)
+                }
+            }
+        }
+
+        val allDocIdsToLookup = buildList(changedOrders.size + removedDocIds.size) {
+            for (item in changedOrders) {
+                if (item.order.firestoreDocId.isNotBlank()) add(item.order.firestoreDocId)
+            }
+            for (removedId in removedDocIds) {
+                if (removedId.isNotBlank()) add(removedId)
+            }
+        }.distinct()
+
+        val existingByDocId = if (allDocIdsToLookup.isNotEmpty()) {
+            orderDao.findByFirestoreDocIds(allDocIdsToLookup).associateBy { it.firestoreDocId }
+        } else {
+            emptyMap()
+        }
+
+        val idsToDelete = mutableListOf<Long>()
+        val ordersToUpsert = mutableListOf<OrderEntity>()
+        val pendingNotifications = mutableListOf<Pair<OrderEntity, Boolean>>() // order + bypassDedupe
+        val bellsToStop = mutableListOf<String>()
+        var shouldStopAllBells = false
+        var shouldReconcileWallets = false
+
+        // 1. Handle REMOVED documents safely without ever deleting historical terminal orders
+        // or orders still matched by another active listener.
+        for (removedDocId in removedDocIds) {
+            if (removedDocId.isBlank() || removedDocId in stillMatchedElsewhere) continue
+            val localExisting = existingByDocId[removedDocId] ?: continue
+            val isTerminalHistorical = localExisting.status == OrderStatus.DELIVERED ||
+                localExisting.status == OrderStatus.CANCELLED ||
+                localExisting.status == OrderStatus.EXPIRED
+            if (isTerminalHistorical) continue
+
+            if (listenerKey == LISTENER_KEY_PENDING_OFFER) {
+                // Pending offer expired, cancelled, or claimed by another captain.
+                // Never delete if locally already accepted/active.
+                if (localExisting.status == OrderStatus.PENDING) {
+                    idsToDelete.add(localExisting.id)
+                    bellsToStop.add(localExisting.firestoreDocId.ifBlank { removedDocId })
+                }
+            } else {
+                // Assignment listener removed this non-terminal order and no other listener owns it
+                // (e.g. reassigned/transferred to another captain or deleted on server).
+                idsToDelete.add(localExisting.id)
+                bellsToStop.add(localExisting.firestoreDocId.ifBlank { removedDocId })
+            }
+        }
+
+        val preservedActiveStatuses = setOf(
+            OrderStatus.AT_STORE,
+            OrderStatus.PICKED_UP,
+            OrderStatus.ORDER_DATA_ENTERED,
+            OrderStatus.AWAITING_MERCHANT_CONFIRMATION,
+            OrderStatus.MERCHANT_REJECTED,
+            OrderStatus.EN_ROUTE
+        )
+
+        // 2. Process ADDED / MODIFIED documents
+        for (item in changedOrders) {
+            val order = item.order
+            val docCaptainId = item.docCaptainId
+            val offeredCaptainId = item.offeredCaptainId
+            val isExcluded = item.isExcluded
+            val hasNoCaptain = isPlaceholderOrUnassigned(docCaptainId)
+            val isAssignedToMe = !hasNoCaptain && (
+                (myUid.isNotBlank() && (docCaptainId == myUid || item.hasMatchingSecondaryUid)) ||
+                    (myPhone.isNotBlank() && (isSamePhone(docCaptainId, myPhone) || item.hasMatchingPhone))
+                )
+            val offeredToOtherCaptain = offeredCaptainId.isNotBlank() &&
+                offeredCaptainId != myUid &&
+                !isAssignedToMe
+            val isAvailable = (order.status == OrderStatus.PENDING) &&
+                hasNoCaptain &&
+                !isExcluded &&
+                !offeredToOtherCaptain
+            val isAcceptedByOther = !isAvailable && !hasNoCaptain && !isAssignedToMe
+            val existingBefore = existingByDocId[order.firestoreDocId]
+
+            if (isAcceptedByOther || isExcluded || offeredToOtherCaptain) {
+                if (existingBefore != null) {
+                    if (existingBefore.status == OrderStatus.DELIVERED) {
+                        shouldReconcileWallets = true
+                    }
+                    idsToDelete.add(existingBefore.id)
+                } else {
+                    idsToDelete.add(order.id)
+                }
+                bellsToStop.add(order.firestoreDocId.ifBlank { item.docId })
+            } else if (order.status == OrderStatus.PENDING && !eligibleForNewOrders) {
+                if (existingBefore != null) {
+                    idsToDelete.add(existingBefore.id)
+                } else {
+                    idsToDelete.add(order.id)
+                }
+                shouldStopAllBells = true
+            } else {
+                val resolvedExpiresAt = when {
+                    order.offerExpiresAt > 0L -> order.offerExpiresAt
+                    existingBefore != null && existingBefore.offerExpiresAt > 0L -> existingBefore.offerExpiresAt
+                    order.status == OrderStatus.PENDING -> System.currentTimeMillis() + 60_000L
+                    else -> 0L
+                }
+                val finalOrderBase = if (isAvailable || (order.status == OrderStatus.PENDING && offeredCaptainId == myUid)) {
+                    order.copy(status = OrderStatus.PENDING, offerExpiresAt = resolvedExpiresAt)
+                } else {
+                    order.copy(offerExpiresAt = resolvedExpiresAt)
+                }
+                val finalOrder = if (
+                    finalOrderBase.status == OrderStatus.PENDING &&
+                    isAssignedToMe &&
+                    existingBefore != null &&
+                    existingBefore.status in preservedActiveStatuses
+                ) {
+                    if (finalOrderBase.merchantConfirmed || existingBefore.merchantConfirmed) {
+                        finalOrderBase.copy(status = OrderStatus.EN_ROUTE, merchantConfirmed = true)
+                    } else {
+                        finalOrderBase.copy(status = existingBefore.status)
+                    }
+                } else {
+                    finalOrderBase
+                }
+                val enrichedOrder = if (finalOrder.storeLocationUrl.isBlank() && !existingBefore?.storeLocationUrl.isNullOrBlank()) {
+                    finalOrder.copy(storeLocationUrl = existingBefore!!.storeLocationUrl)
+                } else {
+                    finalOrder
+                }
+
+                ordersToUpsert.add(enrichedOrder)
+
+                if (enrichedOrder.status == OrderStatus.DELIVERED ||
+                    existingBefore?.status == OrderStatus.DELIVERED
+                ) {
+                    shouldReconcileWallets = true
+                }
+
+                if (enrichedOrder.status == OrderStatus.PENDING &&
+                    eligibleForNewOrders &&
+                    (existingBefore == null || (offeredCaptainId == myUid && enrichedOrder.offerExpiresAt > existingBefore.offerExpiresAt))
+                ) {
+                    val bypassDedupe = existingBefore != null && offeredCaptainId == myUid
+                    pendingNotifications.add(enrichedOrder to bypassDedupe)
+                } else if (enrichedOrder.status != OrderStatus.PENDING) {
+                    bellsToStop.add(enrichedOrder.firestoreDocId.ifBlank { item.docId })
+                }
+            }
+        }
+
+        // 3. Apply batched Room mutations (single bulk transaction for upserts + bulk delete)
+        if (idsToDelete.isNotEmpty()) {
+            orderDao.deleteOrdersByIds(idsToDelete.distinct())
+        }
+        val savedIdsByDocId = if (ordersToUpsert.isNotEmpty()) {
+            orderDao.upsertAllByFirestoreIds(ordersToUpsert)
+        } else {
+            emptyMap()
+        }
+
+        // 4. Side effects (notifications & debounced wallet reconciliation)
+        context?.let { ctx ->
+            if (shouldStopAllBells) {
+                CaptainNotificationManager.stopIncomingOrderBell(ctx)
+            }
+            for (bellKey in bellsToStop.distinct()) {
+                CaptainNotificationManager.stopIncomingOrderBell(ctx, bellKey)
+            }
+            for ((pendingOrder, bypassDedupe) in pendingNotifications) {
+                val savedOrderId = savedIdsByDocId[pendingOrder.firestoreDocId] ?: pendingOrder.id
+                CaptainNotificationManager.showNewOrderNotification(
+                    context = ctx,
+                    orderKey = pendingOrder.firestoreDocId.ifBlank { savedOrderId.toString() },
+                    storeName = pendingOrder.storeName,
+                    pickupAddress = pendingOrder.pickupAddress,
+                    deliveryAddress = pendingOrder.deliveryAddress,
+                    deliveryFee = pendingOrder.deliveryFee,
+                    orderCode = pendingOrder.cleanOrderCode,
+                    storeLocationUrl = pendingOrder.effectiveStoreLocationUrl,
+                    bypassDedupe = bypassDedupe,
+                    orderId = savedOrderId,
+                    offerExpiresAtMs = pendingOrder.offerExpiresAt,
+                    distanceKm = pendingOrder.distanceKm,
+                    startContinuousBell = true
+                )
+            }
+        }
+
+        if (shouldReconcileWallets) {
+            scheduleDailyWalletReconciliation()
+        }
+    }
+
+    fun startRealtimeOrdersListener(consumerId: String = DEFAULT_ORDERS_LISTENER_CONSUMER) {
         if (_accountApprovalState.value != null && !isCurrentSessionApproved) {
             stopRealtimeOrdersListener()
             Log.d("CaptainRepository", "[FirestoreOrdersListener] Blocked: captain account is not approved")
@@ -808,15 +1127,17 @@ class CaptainRepository(
         }
         val confirmedShiftKey = confirmed.workingShiftKey
         synchronized(ordersListenerLock) {
+            ordersListenerConsumers.add(consumerId)
             if (ordersListenerRegistrations.isNotEmpty() &&
                 activeOrdersListenerUid == authUid &&
                 activeOrdersListenerShiftKey == confirmedShiftKey
             ) {
-                Log.d("CaptainRepository", "[FirestoreOrdersListener] Reusing active orders listeners for $authUid ($confirmedShiftKey)")
+                Log.d("CaptainRepository", "[FirestoreOrdersListener] Reusing active orders listeners for $authUid ($confirmedShiftKey), consumers=${ordersListenerConsumers.size}")
                 return
             }
             ordersListenerRegistrations.forEach { runCatching { it.remove() } }
             ordersListenerRegistrations.clear()
+            listenerMatchedDocIds.clear()
             activeOrdersListenerUid = null
             activeOrdersListenerShiftKey = null
 
@@ -834,177 +1155,49 @@ class CaptainRepository(
         }
 
         try {
-            Log.i("CaptainRepository", "[FirestoreOrdersListener] Registering least-privilege scoped listeners on 'orders' for working captain $authUid ($confirmedShiftKey)...")
+            Log.i("CaptainRepository", "[FirestoreOrdersListener] Registering 5 scoped listeners (documentChanges) on 'orders' for working captain $authUid ($confirmedShiftKey)...")
 
-            fun processOrderDocuments(
-                docs: List<DocumentSnapshot>,
-                removedPendingDocs: List<DocumentSnapshot> = emptyList()
+            fun dispatchSnapshotChanges(
+                listenerKey: String,
+                changes: List<DocumentChange>
             ) {
-                CoroutineScope(Dispatchers.IO).launch {
-                    val currentCaptain = captainDao.getCaptain()
-                    val myPhone = currentCaptain?.phoneNumber ?: ""
-                    val myUid = authUid.ifBlank { currentCaptain?.uid.orEmpty() }
-                    val eligibleForNewOrders = isCaptainEligibleForNewOrders(currentCaptain)
+                if (changes.isEmpty()) return
+                repositoryScope.launch {
+                    try {
+                        val currentCaptain = captainDao.getCaptain()
+                        val myPhone = currentCaptain?.phoneNumber ?: ""
+                        val myUid = authUid.ifBlank { currentCaptain?.uid.orEmpty() }
 
-                    if (!eligibleForNewOrders) {
-                        orderDao.deleteAllPendingOrders()
-                        context?.let { CaptainNotificationManager.stopIncomingOrderBell(it) }
-                    }
-
-                    // Clean up pending orders that were claimed by another captain or cancelled
-                    for (removedDoc in removedPendingDocs) {
-                        val parsedRemoved = removedDoc.toOrderEntity() ?: continue
-                        val localExisting = allOrdersFlow.firstOrNull()?.find {
-                            it.id == parsedRemoved.id || it.firestoreDocId == parsedRemoved.firestoreDocId
-                        }
-                        if (localExisting != null && localExisting.status == OrderStatus.PENDING) {
-                            orderDao.deleteOrderById(localExisting.id)
-                            context?.let {
-                                CaptainNotificationManager.stopIncomingOrderBell(
-                                    it,
-                                    localExisting.firestoreDocId.ifBlank { parsedRemoved.firestoreDocId }
-                                )
+                        val changedSnapshots = mutableListOf<ParsedOrderSnapshot>()
+                        val removedIds = mutableListOf<String>()
+                        for (change in changes) {
+                            when (change.type) {
+                                DocumentChange.Type.ADDED,
+                                DocumentChange.Type.MODIFIED -> {
+                                    try {
+                                        change.document.toParsedOrderSnapshot(myUid, myPhone)?.let {
+                                            changedSnapshots.add(it)
+                                        }
+                                    } catch (e: Exception) {
+                                        Log.e("CaptainRepository", "[FirestoreOrdersListener] Error parsing changed order doc ${change.document.id}", e)
+                                    }
+                                }
+                                DocumentChange.Type.REMOVED -> {
+                                    removedIds.add(change.document.id)
+                                }
                             }
                         }
+                        applyOrderSnapshotChanges(
+                            listenerKey = listenerKey,
+                            authUid = myUid,
+                            changedOrders = changedSnapshots,
+                            removedDocIds = removedIds
+                        )
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (e: Exception) {
+                        Log.e("CaptainRepository", "[FirestoreOrdersListener] Error applying changes for $listenerKey", e)
                     }
-
-                    for (doc in docs) {
-                        try {
-                            val order = doc.toOrderEntity() ?: continue
-                            val docCaptainId = doc.safeString(
-                                "captainId", "captain_id", "driverId", "driver_id",
-                                "assignedCaptainId", "assignedDriverId", "captainUid",
-                                "driverUid", "assignedCaptainPhone", "driverPhone", "captain_phone"
-                            )
-                            val offeredCaptainId = doc.safeString("offeredCaptainId", "offered_captain_id")
-                            val isExcluded = doc.isExcludedCaptain(myUid)
-                            val hasNoCaptain = isPlaceholderOrUnassigned(docCaptainId)
-                            val isAssignedToMe = !hasNoCaptain && (
-                                (myUid.isNotBlank() && (
-                                    docCaptainId == myUid ||
-                                        doc.safeString("captainUid", "driverUid", "offeredCaptainId") == myUid
-                                    )) ||
-                                    (myPhone.isNotBlank() && (
-                                        isSamePhone(docCaptainId, myPhone) ||
-                                            isSamePhone(doc.safeString("driverPhone", "assignedCaptainPhone"), myPhone)
-                                        ))
-                                )
-
-                            val offeredToOtherCaptain = offeredCaptainId.isNotBlank() &&
-                                offeredCaptainId != myUid &&
-                                !isAssignedToMe
-                            val isAvailable = (order.status == OrderStatus.PENDING) &&
-                                hasNoCaptain &&
-                                !isExcluded &&
-                                !offeredToOtherCaptain
-                            val isAcceptedByOther = !isAvailable && !hasNoCaptain && !isAssignedToMe
-
-                            if (isAcceptedByOther || isExcluded || offeredToOtherCaptain) {
-                                val existingToRemove = orderDao.findByFirestoreDocId(order.firestoreDocId)
-                                orderDao.deleteOrderById(existingToRemove?.id ?: order.id)
-                                context?.let {
-                                    CaptainNotificationManager.stopIncomingOrderBell(
-                                        it,
-                                        order.firestoreDocId.ifBlank { doc.id }
-                                    )
-                                }
-                            } else if (order.status == OrderStatus.PENDING && !eligibleForNewOrders) {
-                                // Never insert or assign new/pending offers when captain is offline or outside shift hours
-                                val existingToRemove = orderDao.findByFirestoreDocId(order.firestoreDocId)
-                                orderDao.deleteOrderById(existingToRemove?.id ?: order.id)
-                                context?.let { CaptainNotificationManager.stopIncomingOrderBell(it) }
-                            } else {
-                                val existingBefore = orderDao.findByFirestoreDocId(order.firestoreDocId)
-                                val resolvedExpiresAt = when {
-                                    order.offerExpiresAt > 0L -> order.offerExpiresAt
-                                    existingBefore != null && existingBefore.offerExpiresAt > 0L -> existingBefore.offerExpiresAt
-                                    order.status == OrderStatus.PENDING -> System.currentTimeMillis() + 60_000L
-                                    else -> 0L
-                                }
-                                val finalOrderBase = if (isAvailable || (order.status == OrderStatus.PENDING && offeredCaptainId == myUid)) {
-                                    order.copy(status = OrderStatus.PENDING, offerExpiresAt = resolvedExpiresAt)
-                                } else {
-                                    order.copy(offerExpiresAt = resolvedExpiresAt)
-                                }
-                                val preservedActiveStatuses = setOf(
-                                    OrderStatus.AT_STORE,
-                                    OrderStatus.PICKED_UP,
-                                    OrderStatus.ORDER_DATA_ENTERED,
-                                    OrderStatus.AWAITING_MERCHANT_CONFIRMATION,
-                                    OrderStatus.MERCHANT_REJECTED,
-                                    OrderStatus.EN_ROUTE
-                                )
-                                val finalOrder = if (
-                                    finalOrderBase.status == OrderStatus.PENDING &&
-                                    isAssignedToMe &&
-                                    existingBefore != null &&
-                                    existingBefore.status in preservedActiveStatuses
-                                ) {
-                                    if (finalOrderBase.merchantConfirmed || existingBefore.merchantConfirmed) {
-                                        finalOrderBase.copy(status = OrderStatus.EN_ROUTE, merchantConfirmed = true)
-                                    } else {
-                                        finalOrderBase.copy(status = existingBefore.status)
-                                    }
-                                } else {
-                                    finalOrderBase
-                                }
-                                val baseWithExistingLocation = if (finalOrder.storeLocationUrl.isBlank() && !existingBefore?.storeLocationUrl.isNullOrBlank()) {
-                                    finalOrder.copy(storeLocationUrl = existingBefore!!.storeLocationUrl)
-                                } else {
-                                    finalOrder
-                                }
-                                val enrichedOrder = if (baseWithExistingLocation.storeLocationUrl.isBlank() &&
-                                    (baseWithExistingLocation.merchantId.isNotBlank() || baseWithExistingLocation.storeName.isNotBlank())
-                                ) {
-                                    val (accountUrl, accLat, accLng) = lookupMerchantLocationFromFirestore(
-                                        merchantId = baseWithExistingLocation.merchantId,
-                                        storeName = baseWithExistingLocation.storeName,
-                                        forceRefresh = false
-                                    )
-                                    baseWithExistingLocation.copy(
-                                        storeLocationUrl = accountUrl.ifBlank { baseWithExistingLocation.storeLocationUrl },
-                                        restaurantLatitude = baseWithExistingLocation.restaurantLatitude ?: accLat,
-                                        restaurantLongitude = baseWithExistingLocation.restaurantLongitude ?: accLng
-                                    )
-                                } else {
-                                    baseWithExistingLocation
-                                }
-                                val savedOrderId = orderDao.upsertByFirestoreId(enrichedOrder)
-                                if (enrichedOrder.status == OrderStatus.PENDING &&
-                                    eligibleForNewOrders &&
-                                    (existingBefore == null || (offeredCaptainId == myUid && enrichedOrder.offerExpiresAt > (existingBefore.offerExpiresAt)))
-                                ) {
-                                    context?.let { ctx ->
-                                        CaptainNotificationManager.showNewOrderNotification(
-                                            context = ctx,
-                                            orderKey = enrichedOrder.firestoreDocId.ifBlank { savedOrderId.toString() },
-                                            storeName = enrichedOrder.storeName,
-                                            pickupAddress = enrichedOrder.pickupAddress,
-                                            deliveryAddress = enrichedOrder.deliveryAddress,
-                                            deliveryFee = enrichedOrder.deliveryFee,
-                                            orderCode = enrichedOrder.cleanOrderCode,
-                                            storeLocationUrl = enrichedOrder.effectiveStoreLocationUrl,
-                                            bypassDedupe = existingBefore != null && offeredCaptainId == myUid,
-                                            orderId = savedOrderId,
-                                            offerExpiresAtMs = enrichedOrder.offerExpiresAt,
-                                            distanceKm = enrichedOrder.distanceKm,
-                                            startContinuousBell = true
-                                        )
-                                    }
-                                } else if (enrichedOrder.status != OrderStatus.PENDING) {
-                                    context?.let { ctx ->
-                                        CaptainNotificationManager.stopIncomingOrderBell(
-                                            ctx,
-                                            enrichedOrder.firestoreDocId.ifBlank { doc.id }
-                                        )
-                                    }
-                                }
-                            }
-                        } catch (e: Exception) {
-                            Log.e("CaptainRepository", "[FirestoreOrdersListener] Error parsing Firestore order document: ${doc.id}", e)
-                        }
-                    }
-                    reconcileDailyWallets()
                 }
             }
 
@@ -1019,15 +1212,12 @@ class CaptainRepository(
                         return@addSnapshotListener
                     }
                     if (snapshot != null) {
-                        val removed = snapshot.documentChanges
-                            .filter { it.type == com.google.firebase.firestore.DocumentChange.Type.REMOVED }
-                            .map { it.document }
-                        processOrderDocuments(snapshot.documents, removed)
+                        dispatchSnapshotChanges(LISTENER_KEY_PENDING_OFFER, snapshot.documentChanges)
                     }
                 }
 
-            // 2. Captain's own assigned / offered orders (matches firestore.rules isOrderAssignedOrOfferedToCaptain)
-            for (field in listOf("captainId", "driverId", "captainUid", "assignedCaptainId", "offeredCaptainId")) {
+            // 2-5. Captain's own assigned orders across all legacy ownership fields (no duplicate offeredCaptainId listener)
+            for (field in ORDER_ASSIGNMENT_QUERY_FIELDS) {
                 newRegistrations += firestore.collection("orders")
                     .whereEqualTo(field, authUid)
                     .addSnapshotListener { snapshot, error ->
@@ -1036,7 +1226,7 @@ class CaptainRepository(
                             return@addSnapshotListener
                         }
                         if (snapshot != null) {
-                            processOrderDocuments(snapshot.documents)
+                            dispatchSnapshotChanges(field, snapshot.documentChanges)
                         }
                     }
             }
@@ -1045,7 +1235,8 @@ class CaptainRepository(
                 if (stillConfirmed != null &&
                     stillConfirmed.isConfirmedWorking &&
                     stillConfirmed.uid == authUid &&
-                    stillConfirmed.workingShiftKey == confirmedShiftKey
+                    stillConfirmed.workingShiftKey == confirmedShiftKey &&
+                    ordersListenerConsumers.isNotEmpty()
                 ) {
                     ordersListenerRegistrations.forEach { runCatching { it.remove() } }
                     ordersListenerRegistrations.clear()
@@ -1058,6 +1249,23 @@ class CaptainRepository(
             }
         } catch (e: Exception) {
             Log.w("CaptainRepository", "[FirestoreOrdersListener] Error starting Firestore listener: ${e.message}")
+        }
+    }
+
+    /**
+     * Releases a specific consumer's hold on the shared realtime orders listeners.
+     * Listeners remain active if another component (e.g., ViewModel or LocationService) still needs them.
+     */
+    fun releaseOrdersListener(consumerId: String) {
+        synchronized(ordersListenerLock) {
+            ordersListenerConsumers.remove(consumerId)
+            if (ordersListenerConsumers.isEmpty()) {
+                ordersListenerRegistrations.forEach { runCatching { it.remove() } }
+                ordersListenerRegistrations.clear()
+                listenerMatchedDocIds.clear()
+                activeOrdersListenerUid = null
+                activeOrdersListenerShiftKey = null
+            }
         }
     }
 
@@ -1093,18 +1301,12 @@ class CaptainRepository(
             for (doc in docs) {
                 val order = doc.toOrderEntity()
                 if (order != null) {
-                    val captId = doc.safeString(
-                        "captainId", "captain_id", "driverId", "driver_id",
-                        "assignedCaptainId", "assignedDriverId", "captainUid",
-                        "driverUid", "assignedCaptainPhone", "driverPhone", "captain_phone"
-                    )
-                    val rawStatus = doc.safeString("status", default = "pending")
-                    val isUnassigned = isPlaceholderOrUnassigned(captId)
-                    Log.d("CaptainRepository", "[FirestoreQuery] -> Pending Doc ID: ${doc.id}, orderNumber: ${order.orderNumber}, rawStatus: '$rawStatus', unassigned: $isUnassigned")
                     val finalOrder = order.copy(status = OrderStatus.PENDING)
-                    orderDao.upsertByFirestoreId(finalOrder)
                     pendingList.add(finalOrder)
                 }
+            }
+            if (pendingList.isNotEmpty()) {
+                orderDao.upsertAllByFirestoreIds(pendingList)
             }
             Result.success(pendingList)
         } catch (e: Exception) {
@@ -1122,8 +1324,8 @@ class CaptainRepository(
     }
 
     /**
-     * One-time sync of orders from Firestore, returning breakdown of synced total,
-     * available pending orders, and ongoing active orders.
+     * One-time sync of orders from Firestore, executing parallel scoped queries (without duplicate
+     * offeredCaptainId) and saving results in a single Room bulk transaction.
      */
     suspend fun syncOrdersDetailedFromFirestore(): Result<SyncOrdersSummary> {
         return try {
@@ -1142,58 +1344,82 @@ class CaptainRepository(
                 context?.let { CaptainNotificationManager.stopIncomingOrderBell(it) }
             }
 
-            Log.i("CaptainRepository", "[FirestoreSync] Syncing scoped orders for captain UID: $myUid (eligibleForNewOrders=$eligibleForNewOrders)...")
+            Log.i("CaptainRepository", "[FirestoreSync] Syncing scoped orders in parallel for captain UID: $myUid (eligibleForNewOrders=$eligibleForNewOrders)...")
             val matchedDocs = linkedMapOf<String, DocumentSnapshot>()
 
-            // 1. Available pending orders (ONLY when captain is online and inside shift hours)
-            if (eligibleForNewOrders) {
-                try {
-                    val pendingSnapshot = firestore.collection("orders")
-                        .whereEqualTo("status", "pending")
-                        .whereEqualTo("offeredCaptainId", myUid)
-                        .get()
-                        .await()
-                    for (doc in pendingSnapshot.documents) {
-                        matchedDocs[doc.id] = doc
+            val queryResults: List<List<DocumentSnapshot>> = coroutineScope {
+                val jobs = mutableListOf<kotlinx.coroutines.Deferred<List<DocumentSnapshot>>>()
+                if (eligibleForNewOrders) {
+                    jobs += async(Dispatchers.IO) {
+                        try {
+                            firestore.collection("orders")
+                                .whereEqualTo("status", "pending")
+                                .whereEqualTo("offeredCaptainId", myUid)
+                                .get()
+                                .await()
+                                .documents
+                        } catch (e: Exception) {
+                            Log.w("CaptainRepository", "[FirestoreSync] scoped pending query notice: ${e.message}")
+                            emptyList()
+                        }
                     }
-                } catch (e: Exception) {
-                    Log.w("CaptainRepository", "[FirestoreSync] scoped pending query notice: ${e.message}")
+                }
+                for (field in ORDER_ASSIGNMENT_QUERY_FIELDS) {
+                    jobs += async(Dispatchers.IO) {
+                        try {
+                            firestore.collection("orders")
+                                .whereEqualTo(field, myUid)
+                                .get()
+                                .await()
+                                .documents
+                        } catch (e: Exception) {
+                            Log.w("CaptainRepository", "[FirestoreSync] $field == uid query notice: ${e.message}")
+                            emptyList()
+                        }
+                    }
+                }
+                jobs.awaitAll()
+            }
+
+            for (docs in queryResults) {
+                for (doc in docs) {
+                    matchedDocs[doc.id] = doc
                 }
             }
 
-            // 2. Captain's own assigned / offered orders
-            for (field in listOf("captainId", "driverId", "captainUid", "assignedCaptainId", "offeredCaptainId")) {
-                try {
-                    val ownSnap = firestore.collection("orders")
-                        .whereEqualTo(field, myUid)
-                        .get()
-                        .await()
-                    for (doc in ownSnap.documents) {
-                        matchedDocs[doc.id] = doc
-                    }
-                } catch (e: Exception) {
-                    Log.w("CaptainRepository", "[FirestoreSync] $field == uid query notice: ${e.message}")
-                }
+            val existingByDocId = if (matchedDocs.isNotEmpty()) {
+                orderDao.findByFirestoreDocIds(matchedDocs.keys.toList()).associateBy { it.firestoreDocId }
+            } else {
+                emptyMap()
             }
+
+            val preservedActiveStatuses = setOf(
+                OrderStatus.AT_STORE,
+                OrderStatus.PICKED_UP,
+                OrderStatus.ORDER_DATA_ENTERED,
+                OrderStatus.AWAITING_MERCHANT_CONFIRMATION,
+                OrderStatus.MERCHANT_REJECTED,
+                OrderStatus.EN_ROUTE
+            )
 
             var count = 0
             var pendingCount = 0
             var activeCount = 0
+            val idsToDelete = mutableListOf<Long>()
+            val ordersToUpsert = mutableListOf<OrderEntity>()
+            var shouldReconcileWallets = false
 
             for (doc in matchedDocs.values) {
-                val order = doc.toOrderEntity() ?: continue
-                val docCaptainId = doc.safeString(
-                    "captainId", "captain_id", "driverId", "driver_id",
-                    "assignedCaptainId", "assignedDriverId", "captainUid",
-                    "driverUid", "assignedCaptainPhone", "driverPhone", "captain_phone"
-                )
-                val offeredCaptainId = doc.safeString("offeredCaptainId", "offered_captain_id")
-                val isExcluded = doc.isExcludedCaptain(myUid)
+                val parsed = doc.toParsedOrderSnapshot(myUid, myPhone) ?: continue
+                val order = parsed.order
+                val docCaptainId = parsed.docCaptainId
+                val offeredCaptainId = parsed.offeredCaptainId
+                val isExcluded = parsed.isExcluded
 
                 val hasNoCaptain = isPlaceholderOrUnassigned(docCaptainId)
                 val isAssignedToMe = !hasNoCaptain && (
                     docCaptainId == myUid ||
-                        doc.safeString("captainUid", "driverUid", "offeredCaptainId") == myUid ||
+                        parsed.hasMatchingSecondaryUid ||
                         (myPhone.isNotBlank() && isSamePhone(docCaptainId, myPhone))
                     )
                 val offeredToOtherCaptain = offeredCaptainId.isNotBlank() &&
@@ -1205,10 +1431,10 @@ class CaptainRepository(
                     !isExcluded &&
                     !offeredToOtherCaptain
                 val isAcceptedByOther = !isAvailable && !hasNoCaptain && !isAssignedToMe
+                val existingLocal = existingByDocId[order.firestoreDocId]
 
                 if (isAcceptedByOther || isExcluded || offeredToOtherCaptain) {
-                    val existingToDelete = orderDao.findByFirestoreDocId(order.firestoreDocId)
-                    orderDao.deleteOrderById(existingToDelete?.id ?: order.id)
+                    idsToDelete.add(existingLocal?.id ?: order.id)
                     context?.let {
                         CaptainNotificationManager.stopIncomingOrderBell(
                             it,
@@ -1216,25 +1442,15 @@ class CaptainRepository(
                         )
                     }
                 } else if (order.status == OrderStatus.PENDING && !eligibleForNewOrders) {
-                    val existingToDelete = orderDao.findByFirestoreDocId(order.firestoreDocId)
-                    orderDao.deleteOrderById(existingToDelete?.id ?: order.id)
+                    idsToDelete.add(existingLocal?.id ?: order.id)
                     context?.let { CaptainNotificationManager.stopIncomingOrderBell(it) }
                 } else {
-                    val existingLocal = orderDao.findByFirestoreDocId(order.firestoreDocId)
                     val resolvedExpiresAt = when {
                         order.offerExpiresAt > 0L -> order.offerExpiresAt
                         existingLocal != null && existingLocal.offerExpiresAt > 0L -> existingLocal.offerExpiresAt
                         order.status == OrderStatus.PENDING -> System.currentTimeMillis() + 60_000L
                         else -> 0L
                     }
-                    val preservedActiveStatuses = setOf(
-                        OrderStatus.AT_STORE,
-                        OrderStatus.PICKED_UP,
-                        OrderStatus.ORDER_DATA_ENTERED,
-                        OrderStatus.AWAITING_MERCHANT_CONFIRMATION,
-                        OrderStatus.MERCHANT_REJECTED,
-                        OrderStatus.EN_ROUTE
-                    )
                     val resolvedOrder = if (
                         order.status == OrderStatus.PENDING &&
                         isAssignedToMe &&
@@ -1258,28 +1474,24 @@ class CaptainRepository(
                         }
                         resolvedOrder
                     }
-                    val baseWithLocation = if (finalOrder.storeLocationUrl.isBlank() &&
-                        (finalOrder.merchantId.isNotBlank() || finalOrder.storeName.isNotBlank())
-                    ) {
-                        val (accountUrl, accLat, accLng) = lookupMerchantLocationFromFirestore(
-                            merchantId = finalOrder.merchantId,
-                            storeName = finalOrder.storeName,
-                            forceRefresh = false
-                        )
-                        finalOrder.copy(
-                            storeLocationUrl = accountUrl.ifBlank { finalOrder.storeLocationUrl },
-                            restaurantLatitude = finalOrder.restaurantLatitude ?: accLat,
-                            restaurantLongitude = finalOrder.restaurantLongitude ?: accLng
-                        )
-                    } else {
-                        finalOrder
+                    if (finalOrder.status == OrderStatus.DELIVERED || existingLocal?.status == OrderStatus.DELIVERED) {
+                        shouldReconcileWallets = true
                     }
-                    orderDao.upsertByFirestoreId(baseWithLocation)
+                    ordersToUpsert.add(finalOrder)
                     count++
                 }
             }
 
-            reconcileDailyWallets()
+            if (idsToDelete.isNotEmpty()) {
+                orderDao.deleteOrdersByIds(idsToDelete.distinct())
+            }
+            if (ordersToUpsert.isNotEmpty()) {
+                orderDao.upsertAllByFirestoreIds(ordersToUpsert)
+            }
+
+            if (shouldReconcileWallets) {
+                reconcileDailyWallets()
+            }
             Log.i("CaptainRepository", "[FirestoreSync] Sync complete: $count orders saved ($pendingCount PENDING, $activeCount active)")
             Result.success(SyncOrdersSummary(totalSynced = count, pendingCount = pendingCount, activeCount = activeCount))
         } catch (e: Exception) {
@@ -1288,38 +1500,267 @@ class CaptainRepository(
         }
     }
 
+    private suspend fun syncDailyWalletsSubcollection(myUid: String) {
+        if (myUid.isBlank()) return
+        try {
+            val dailySnap = firestore.collection("captains")
+                .document(myUid)
+                .collection("daily_wallets")
+                .get()
+                .await()
+            val remoteRecords = dailySnap.documents.mapNotNull { d ->
+                val dayKey = d.safeString("dayKey", default = d.id)
+                if (!DATE_KEY_REGEX.matches(dayKey)) return@mapNotNull null
+                val (startMs, endMs) = DailyWalletManager.getOperationalDayBounds(dayKey)
+                DailyWalletEntity(
+                    dayKey = dayKey,
+                    captainUid = myUid,
+                    periodStartMs = d.safeLong("periodStartMs", default = startMs),
+                    periodEndMs = d.safeLong("periodEndMs", default = endMs),
+                    walletBalance = d.safeDouble("walletBalance", default = 0.0),
+                    deliveredOrdersCount = d.safeLong("deliveredOrdersCount", default = 0L).toInt(),
+                    totalOrdersCount = d.safeLong("totalOrdersCount", default = 0L).toInt(),
+                    isClosed = (d.get("isClosed") as? Boolean) ?: (dayKey < DailyWalletManager.getOperationalDayKey()),
+                    closedAt = d.safeLong("closedAt", default = 0L),
+                    updatedAt = d.safeLong("updatedAt", default = System.currentTimeMillis())
+                )
+            }
+            if (remoteRecords.isNotEmpty()) {
+                dailyWalletDao?.upsertAll(remoteRecords)
+            }
+        } catch (_: Exception) {
+            // Subcollection might be restricted by rules; local Room daily_wallet_records handles persistence seamlessly
+        }
+    }
+
+    private suspend fun persistOwnedHistoryDocuments(
+        docs: Collection<DocumentSnapshot>,
+        myUid: String,
+        myPhone: String
+    ): Int {
+        val toSave = mutableListOf<OrderEntity>()
+        for (doc in docs) {
+            val parsed = doc.toOrderEntity() ?: continue
+            val docCapt = doc.safeString(
+                "captainId", "captain_id", "driverId", "driver_id",
+                "assignedCaptainId", "assignedDriverId", "captainUid",
+                "driverUid", "assignedCaptainPhone", "driverPhone", "captain_phone"
+            )
+            val isOwnedByMe = docCapt == myUid ||
+                doc.safeString("captainUid", "driverUid") == myUid ||
+                (myPhone.isNotBlank() && isSamePhone(docCapt, myPhone))
+            if (!isOwnedByMe) continue
+
+            val ensuredCaptainId = if (isPlaceholderOrUnassigned(parsed.captainId)) {
+                parsed.copy(captainId = myUid)
+            } else {
+                parsed
+            }
+            toSave.add(ensuredCaptainId)
+        }
+        if (toSave.isNotEmpty()) {
+            orderDao.upsertAllByFirestoreIds(toSave)
+        }
+        return toSave.size
+    }
+
     /**
-     * Syncs all historical orders assigned to this captain from Firestore (strictly by authenticated UID)
-     * and reconciles daily wallet balances rolled over at 1:00 PM Cairo time.
+     * Attempts a date-bounded parallel Firestore sync for [windowStartMs, windowEndMs] across the 4
+     * legacy ownership fields. Returns null if the Firestore backend lacks the required composite
+     * index (FAILED_PRECONDITION), allowing the caller to fall back seamlessly without breaking.
      */
-    suspend fun syncCaptainOrdersHistoryFromFirestore(): Result<Int> {
+    private suspend fun trySyncDateBoundedOrders(
+        myUid: String,
+        myPhone: String,
+        windowStartMs: Long,
+        windowEndMs: Long
+    ): Result<Int>? {
+        if (dateBoundedHistoryIndexUnavailable) return null
+
+        val startTs = Timestamp(Date(windowStartMs))
+        val endTs = Timestamp(Date(windowEndMs))
+        val matchedDocs = linkedMapOf<String, DocumentSnapshot>()
+        var succeededQueries = 0
+        var missingIndexDetected = false
+        var lastError: Exception? = null
+
+        val results = coroutineScope {
+            ORDER_ASSIGNMENT_QUERY_FIELDS.map { field ->
+                async(Dispatchers.IO) {
+                    try {
+                        val snap = firestore.collection("orders")
+                            .whereEqualTo(field, myUid)
+                            .whereGreaterThanOrEqualTo("createdAt", startTs)
+                            .whereLessThanOrEqualTo("createdAt", endTs)
+                            .get()
+                            .await()
+                        Result.success(snap.documents)
+                    } catch (e: Exception) {
+                        Result.failure(e)
+                    }
+                }
+            }.awaitAll()
+        }
+
+        for (res in results) {
+            if (res.isSuccess) {
+                succeededQueries++
+                for (doc in res.getOrDefault(emptyList())) {
+                    matchedDocs[doc.id] = doc
+                }
+            } else {
+                val err = res.exceptionOrNull() as? Exception
+                val fsEx = err as? FirebaseFirestoreException
+                if (fsEx?.code == FirebaseFirestoreException.Code.FAILED_PRECONDITION) {
+                    missingIndexDetected = true
+                }
+                if (err != null) lastError = err
+            }
+        }
+
+        if (missingIndexDetected) {
+            dateBoundedHistoryIndexUnavailable = true
+            Log.i("CaptainRepository", "[HistorySync] Composite index unavailable for createdAt range query; falling back to TTL-cached history sync")
+            return null
+        }
+        if (succeededQueries == 0 && lastError != null) {
+            return Result.failure(lastError)
+        }
+
+        val savedCount = persistOwnedHistoryDocuments(matchedDocs.values, myUid, myPhone)
+        return Result.success(savedCount)
+    }
+
+    /**
+     * Lightweight startup & operational-day sync: downloads only the current Cairo operational cycle
+     * (+ 48h overnight buffer) and daily wallet summaries instead of pulling the entire lifetime
+     * order archive on cold start. Protected by a session TTL cache.
+     */
+    suspend fun syncRecentOperationalOrdersFromFirestore(forceRefresh: Boolean = false): Result<Int> {
         val currentCaptain = captainDao.getCaptain()
-        val myUid = firebaseAuth.currentUser?.uid ?: currentCaptain?.uid ?: ""
+        val myUid = runCatching { firebaseAuth.currentUser?.uid }.getOrNull()?.takeIf { it.isNotBlank() }
+            ?: currentCaptain?.uid.orEmpty()
         if (myUid.isBlank()) {
             return Result.failure(IllegalStateException("لا يوجد كابتن مسجل حالياً"))
         }
 
+        return historySyncMutex.withLock {
+            val nowMs = System.currentTimeMillis()
+            if (!forceRefresh &&
+                ((lastOperationalHistorySyncUid == myUid && (nowMs - lastOperationalHistorySyncAtMs) < HISTORY_SYNC_TTL_MS) ||
+                    (lastFullHistorySyncUid == myUid && (nowMs - lastFullHistorySyncAtMs) < HISTORY_SYNC_TTL_MS))
+            ) {
+                return@withLock Result.success(0)
+            }
+
+            val myPhone = currentCaptain?.phoneNumber.orEmpty()
+            val currentDayKey = DailyWalletManager.getOperationalDayKey(nowMs)
+            val (opStartMs, opEndMs) = DailyWalletManager.getOperationalDayBounds(currentDayKey)
+            val windowStartMs = opStartMs - OVERNIGHT_QUERY_BUFFER_MS
+            val windowEndMs = maxOf(opEndMs, nowMs) + 60L * 60L * 1000L
+
+            val boundedResult = trySyncDateBoundedOrders(
+                myUid = myUid,
+                myPhone = myPhone,
+                windowStartMs = windowStartMs,
+                windowEndMs = windowEndMs
+            )
+
+            if (boundedResult != null) {
+                syncDailyWalletsSubcollection(myUid)
+                reconcileDailyWallets(nowMs)
+                if (boundedResult.isSuccess) {
+                    lastOperationalHistorySyncUid = myUid
+                    lastOperationalHistorySyncAtMs = nowMs
+                    syncedDateKeysCache["$myUid:$currentDayKey"] = nowMs
+                }
+                return@withLock boundedResult
+            }
+
+            // Fallback when Firestore composite index isn't deployed: run TTL-cached parallel sync once
+            val fallbackResult = syncCaptainOrdersHistoryInternal(
+                myUid = myUid,
+                myPhone = myPhone,
+                forceRefresh = forceRefresh
+            )
+            if (fallbackResult.isSuccess) {
+                lastOperationalHistorySyncUid = myUid
+                lastOperationalHistorySyncAtMs = nowMs
+            }
+            fallbackResult
+        }
+    }
+
+    /**
+     * Syncs all historical orders assigned to this captain from Firestore (strictly by authenticated UID)
+     * in parallel, upserts in a single Room transaction, and reconciles daily wallet balances rolled over
+     * at 1:00 PM Cairo time. Respects TTL unless [forceRefresh] is true.
+     */
+    suspend fun syncCaptainOrdersHistoryFromFirestore(forceRefresh: Boolean = false): Result<Int> {
+        val currentCaptain = captainDao.getCaptain()
+        val myUid = runCatching { firebaseAuth.currentUser?.uid }.getOrNull()?.takeIf { it.isNotBlank() }
+            ?: currentCaptain?.uid.orEmpty()
+        if (myUid.isBlank()) {
+            return Result.failure(IllegalStateException("لا يوجد كابتن مسجل حالياً"))
+        }
+        return historySyncMutex.withLock {
+            syncCaptainOrdersHistoryInternal(
+                myUid = myUid,
+                myPhone = currentCaptain?.phoneNumber.orEmpty(),
+                forceRefresh = forceRefresh
+            )
+        }
+    }
+
+    private suspend fun syncCaptainOrdersHistoryInternal(
+        myUid: String,
+        myPhone: String,
+        forceRefresh: Boolean
+    ): Result<Int> {
+        val nowMs = System.currentTimeMillis()
+        if (!forceRefresh &&
+            lastFullHistorySyncUid == myUid &&
+            (nowMs - lastFullHistorySyncAtMs) < HISTORY_SYNC_TTL_MS
+        ) {
+            return Result.success(0)
+        }
+
         return try {
             val matchedDocs = linkedMapOf<String, DocumentSnapshot>()
-
-            val myPhone = currentCaptain?.phoneNumber ?: ""
-            val queryFields = listOf("captainId", "driverId", "captainUid", "assignedCaptainId")
             var succeededQueries = 0
             var lastQueryError: Exception? = null
 
-            for (field in queryFields) {
-                try {
-                    val snap = firestore.collection("orders")
-                        .whereEqualTo(field, myUid)
-                        .get()
-                        .await()
+            val results = coroutineScope {
+                val orderJobs = ORDER_ASSIGNMENT_QUERY_FIELDS.map { field ->
+                    async(Dispatchers.IO) {
+                        try {
+                            val snap = firestore.collection("orders")
+                                .whereEqualTo(field, myUid)
+                                .get()
+                                .await()
+                            Result.success(snap.documents)
+                        } catch (e: Exception) {
+                            Log.w("CaptainRepository", "[HistorySync] Query orders.$field == uid notice: ${e.message}")
+                            Result.failure(e)
+                        }
+                    }
+                }
+                val walletJob = async(Dispatchers.IO) {
+                    syncDailyWalletsSubcollection(myUid)
+                }
+                val orderResults = orderJobs.awaitAll()
+                walletJob.await()
+                orderResults
+            }
+
+            for (res in results) {
+                if (res.isSuccess) {
                     succeededQueries++
-                    for (doc in snap.documents) {
+                    for (doc in res.getOrDefault(emptyList())) {
                         matchedDocs[doc.id] = doc
                     }
-                } catch (e: Exception) {
-                    lastQueryError = e
-                    Log.w("CaptainRepository", "[HistorySync] Query orders.$field == uid notice: ${e.message}")
+                } else {
+                    (res.exceptionOrNull() as? Exception)?.let { lastQueryError = it }
                 }
             }
 
@@ -1328,62 +1769,10 @@ class CaptainRepository(
                 return Result.failure(lastQueryError)
             }
 
-            var savedCount = 0
-            for (doc in matchedDocs.values) {
-                val parsed = doc.toOrderEntity() ?: continue
-                val docCapt = doc.safeString(
-                    "captainId", "captain_id", "driverId", "driver_id",
-                    "assignedCaptainId", "assignedDriverId", "captainUid",
-                    "driverUid", "assignedCaptainPhone", "driverPhone", "captain_phone"
-                )
-                val isOwnedByMe = docCapt == myUid ||
-                    doc.safeString("captainUid", "driverUid") == myUid ||
-                    (myPhone.isNotBlank() && isSamePhone(docCapt, myPhone))
-                if (!isOwnedByMe) continue
-
-                val ensuredCaptainId = if (isPlaceholderOrUnassigned(parsed.captainId)) {
-                    parsed.copy(captainId = myUid)
-                } else {
-                    parsed
-                }
-                orderDao.upsertByFirestoreId(ensuredCaptainId)
-                savedCount++
-            }
-
-            // Also read any previously archived daily wallet snapshots from Firestore if permitted
-            if (myUid.isNotBlank()) {
-                try {
-                    val dailySnap = firestore.collection("captains")
-                        .document(myUid)
-                        .collection("daily_wallets")
-                        .get()
-                        .await()
-                    val remoteRecords = dailySnap.documents.mapNotNull { d ->
-                        val dayKey = d.safeString("dayKey", default = d.id)
-                        if (!dayKey.matches(Regex("\\d{4}-\\d{2}-\\d{2}"))) return@mapNotNull null
-                        val (startMs, endMs) = DailyWalletManager.getOperationalDayBounds(dayKey)
-                        DailyWalletEntity(
-                            dayKey = dayKey,
-                            captainUid = myUid,
-                            periodStartMs = d.safeLong("periodStartMs", default = startMs),
-                            periodEndMs = d.safeLong("periodEndMs", default = endMs),
-                            walletBalance = d.safeDouble("walletBalance", default = 0.0),
-                            deliveredOrdersCount = d.safeLong("deliveredOrdersCount", default = 0L).toInt(),
-                            totalOrdersCount = d.safeLong("totalOrdersCount", default = 0L).toInt(),
-                            isClosed = (d.get("isClosed") as? Boolean) ?: (dayKey < DailyWalletManager.getOperationalDayKey()),
-                            closedAt = d.safeLong("closedAt", default = 0L),
-                            updatedAt = d.safeLong("updatedAt", default = System.currentTimeMillis())
-                        )
-                    }
-                    if (remoteRecords.isNotEmpty()) {
-                        dailyWalletDao?.upsertAll(remoteRecords)
-                    }
-                } catch (_: Exception) {
-                    // Subcollection might be restricted by rules; local Room daily_wallet_records handles persistence seamlessly
-                }
-            }
-
+            val savedCount = persistOwnedHistoryDocuments(matchedDocs.values, myUid, myPhone)
             reconcileDailyWallets()
+            lastFullHistorySyncUid = myUid
+            lastFullHistorySyncAtMs = System.currentTimeMillis()
             Result.success(savedCount)
         } catch (e: Exception) {
             Log.w("CaptainRepository", "[HistorySync] syncCaptainOrdersHistoryFromFirestore notice: ${e.message}")
@@ -1394,9 +1783,16 @@ class CaptainRepository(
 
     /**
      * Fetches and syncs archived finished orders (DELIVERED and CANCELLED) strictly for the
-     * logged-in captain and counts orders finished on the requested calendar dateKey ("yyyy-MM-dd").
+     * logged-in captain on the requested calendar [dateKey] ("yyyy-MM-dd").
+     * - Serves local Room immediately via reactive Flows; uses per-date TTL cache to avoid
+     *   redundant Firestore queries when switching dates or tabs.
+     * - Bypasses cache when [forceRefresh] is true (manual refresh button).
+     * - Never deletes historical records from Firestore or Room.
      */
-    suspend fun syncCaptainArchivedOrdersForDate(dateKey: String): Result<Int> {
+    suspend fun syncCaptainArchivedOrdersForDate(
+        dateKey: String,
+        forceRefresh: Boolean = false
+    ): Result<Int> {
         val currentCaptain = captainDao.getCaptain()
         val myUid = cloudMetadataPort.currentAuthUid()?.takeIf { it.isNotBlank() }
             ?: runCatching { firebaseAuth.currentUser?.uid }.getOrNull()?.takeIf { it.isNotBlank() }
@@ -1405,13 +1801,64 @@ class CaptainRepository(
             return Result.failure(IllegalStateException("يجب تسجيل الدخول لعرض سجل الطلبات"))
         }
 
-        val syncResult = syncCaptainOrdersHistoryFromFirestore()
-        if (syncResult.isFailure) {
-            return syncResult
+        val myPhone = currentCaptain?.phoneNumber.orEmpty()
+        val cacheKey = "$myUid:$dateKey"
+        val nowMs = System.currentTimeMillis()
+        val isCacheFresh = !forceRefresh && (
+            (syncedDateKeysCache[cacheKey]?.let { (nowMs - it) < HISTORY_SYNC_TTL_MS } == true) ||
+                (lastFullHistorySyncUid == myUid && (nowMs - lastFullHistorySyncAtMs) < HISTORY_SYNC_TTL_MS)
+            )
+
+        if (!isCacheFresh) {
+            val override = archivedOrdersDateSyncOverride
+            val syncResult = if (override != null) {
+                override(myUid, dateKey, forceRefresh).also { res ->
+                    if (res.isSuccess) {
+                        syncedDateKeysCache[cacheKey] = System.currentTimeMillis()
+                    }
+                }
+            } else {
+                historySyncMutex.withLock {
+                    val freshInsideLock = !forceRefresh && (
+                        (syncedDateKeysCache[cacheKey]?.let { (System.currentTimeMillis() - it) < HISTORY_SYNC_TTL_MS } == true) ||
+                            (lastFullHistorySyncUid == myUid && (System.currentTimeMillis() - lastFullHistorySyncAtMs) < HISTORY_SYNC_TTL_MS)
+                        )
+                    if (freshInsideLock) {
+                        Result.success(0)
+                    } else {
+                        val (dayStartMs, dayEndMs) = OrderHistoryHelper.getCalendarDayBoundsMs(dateKey)
+                        val bounded = trySyncDateBoundedOrders(
+                            myUid = myUid,
+                            myPhone = myPhone,
+                            windowStartMs = dayStartMs - OVERNIGHT_QUERY_BUFFER_MS,
+                            windowEndMs = dayEndMs + OVERNIGHT_QUERY_BUFFER_MS
+                        )
+                        if (bounded != null) {
+                            if (bounded.isSuccess) {
+                                syncedDateKeysCache[cacheKey] = System.currentTimeMillis()
+                                reconcileDailyWallets()
+                            }
+                            bounded
+                        } else {
+                            syncCaptainOrdersHistoryInternal(
+                                myUid = myUid,
+                                myPhone = myPhone,
+                                forceRefresh = forceRefresh
+                            ).also { res ->
+                                if (res.isSuccess) {
+                                    syncedDateKeysCache[cacheKey] = System.currentTimeMillis()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (syncResult.isFailure) {
+                return syncResult
+            }
         }
 
-        val myPhone = currentCaptain?.phoneNumber.orEmpty()
-        val allLocal = allOrdersFlow.firstOrNull().orEmpty()
+        val allLocal = orderDao.getAllOrdersSnapshot()
         val matchingForDate = OrderHistoryHelper.filterArchivedOrdersForDate(
             allOrders = allLocal,
             captainUid = myUid,
@@ -1419,6 +1866,16 @@ class CaptainRepository(
             selectedDateKey = dateKey
         )
         return Result.success(matchingForDate.size)
+    }
+
+    internal fun clearHistorySyncCaches() {
+        lastFullHistorySyncUid = null
+        lastFullHistorySyncAtMs = 0L
+        lastOperationalHistorySyncUid = null
+        lastOperationalHistorySyncAtMs = 0L
+        syncedDateKeysCache.clear()
+        lastShiftSyncUid = null
+        lastShiftSyncAtMs = 0L
     }
 
     /**
@@ -1431,9 +1888,9 @@ class CaptainRepository(
         val dao = dailyWalletDao ?: return
         try {
             val currentCaptain = captainDao.getCaptain()
-            val myUid = firebaseAuth.currentUser?.uid ?: currentCaptain?.uid ?: ""
+            val myUid = runCatching { firebaseAuth.currentUser?.uid }.getOrNull() ?: currentCaptain?.uid ?: ""
             val myPhone = currentCaptain?.phoneNumber ?: ""
-            val allOrders = allOrdersFlow.firstOrNull().orEmpty()
+            val allOrders = orderDao.getAllOrdersSnapshot()
             val ownOrders = allOrders.filter { DailyWalletManager.isCaptainOwnOrder(it, myUid, myPhone) }
             val existing = dao.getAllDailyWallets()
 
@@ -1476,29 +1933,23 @@ class CaptainRepository(
     }
 
     /**
-     * Stops realtime orders listeners.
+     * Force-stops all realtime orders listeners and clears every registered consumer.
+     * Used when captain goes offline, logs out, loses approval, or leaves active shift.
      */
     fun stopRealtimeOrdersListener() {
         synchronized(ordersListenerLock) {
+            ordersListenerConsumers.clear()
             ordersListenerRegistrations.forEach { runCatching { it.remove() } }
             ordersListenerRegistrations.clear()
+            listenerMatchedDocIds.clear()
             activeOrdersListenerUid = null
             activeOrdersListenerShiftKey = null
         }
     }
 
     /**
-     * Starts a realtime Firestore listener for the captain's work shifts.
-     * Primary target: 'captain_schedules' collection where admin panel assigns shifts.
-     * Listens to:
-     * 1. 'captain_schedules/{uid}' document (per-captain schedule doc).
-     * 2. 'captain_schedules/{uid}/shifts' subcollection.
-     * 3. 'captain_schedules' collection where captainId == uid.
-     * 4. 'captain_schedules' collection where captainUid == uid.
-     * 5. 'captains/{uid}/shifts' subcollection.
-     * 6. Embedded schedule in 'captains/{uid}' profile document.
-     * 7. Legacy 'shifts' collection.
-     * Updates local Room DB atomically (delete old captain shifts + insert new in single transaction).
+     * Starts a 30-minute schedule poller for the captain's work shifts.
+     * Deduplicated per UID so multiple consumers never spawn duplicate polling jobs.
      */
     fun startRealtimeShiftListener() {
         if (hasTestBackendOverride) return
@@ -1515,20 +1966,20 @@ class CaptainRepository(
         _isShiftNetworkConnected.value = true
         Log.i("CaptainRepository", "[ShiftPolling] Starting 30-minute schedule polling for captain $uid")
 
-        shiftSyncJob = CoroutineScope(Dispatchers.IO).launch {
+        shiftSyncJob = repositoryScope.launch {
             while (kotlin.coroutines.coroutineContext[kotlinx.coroutines.Job]?.isActive == true) {
                 if (runCatching { firebaseAuth.currentUser?.uid }.getOrNull() != uid) {
                     Log.i("CaptainRepository", "[ShiftPolling] Auth session changed; stopping schedule polling")
                     break
                 }
-                val result = syncShiftsFromFirestore()
+                val result = syncShiftsFromFirestore(forceRefresh = false)
                 _isShiftNetworkConnected.value = result.isSuccess
                 if (result.isSuccess) {
                     Log.i("CaptainRepository", "[ShiftPolling] Schedule refreshed; next database read in 30 minutes")
                 } else {
                     Log.w("CaptainRepository", "[ShiftPolling] Schedule refresh failed: ${result.exceptionOrNull()?.message}")
                 }
-                kotlinx.coroutines.delay(shiftSyncIntervalMs)
+                delay(shiftSyncIntervalMs)
             }
         }
     }
@@ -1570,116 +2021,104 @@ class CaptainRepository(
 
     /**
      * One-time sync of shifts from Firestore for manual refresh or initial load.
-     * Prioritizes canonical 'captain_schedules/{uid}', falling back to legacy locations only if absent,
-     * and clears local Room shifts when neither canonical nor valid legacy shifts exist.
+     * Deduplicated via [shiftSyncMutex] + short TTL (30s) when [forceRefresh] is false
+     * so concurrent startup callers never duplicate Firestore reads.
      */
-    suspend fun syncShiftsFromFirestore(): Result<List<ShiftEntity>> {
+    suspend fun syncShiftsFromFirestore(forceRefresh: Boolean = false): Result<List<ShiftEntity>> {
         val user = firebaseAuth.currentUser ?: return Result.failure(IllegalStateException("يرجى تسجيل الدخول أولاً"))
         val uid = user.uid
-        return try {
-            Log.i("CaptainRepository", "[ShiftSync] Reading canonical captain_schedules/$uid first")
-            val canonicalDoc = firestore.collection("captain_schedules").document(uid).get().await()
-            if (canonicalDoc.exists()) {
-                val applied = syncShiftsUsingResolvedSources(
-                    uid = uid,
-                    canonicalDocExists = true,
-                    canonicalDocData = canonicalDoc.data
-                )
-                return Result.success(applied)
+        return shiftSyncMutex.withLock {
+            val nowMs = System.currentTimeMillis()
+            if (!forceRefresh &&
+                lastShiftSyncUid == uid &&
+                (nowMs - lastShiftSyncAtMs) < SHIFT_SYNC_DEDUPE_TTL_MS
+            ) {
+                val cached = getShifts()
+                return@withLock Result.success(cached)
             }
-
-            // Legacy fallback is used only when the canonical admin schedule document is absent.
-            val candidateLists = mutableListOf<List<ShiftEntity>>()
-
-            // 1b. Fetch from 'captain_schedules/{uid}/shifts' subcollection
             try {
-                val subSnap = firestore.collection("captain_schedules").document(uid).collection("shifts").get().await()
-                val subList = mutableListOf<ShiftEntity>()
-                for (d in subSnap.documents) {
-                    subList.addAll(d.extractAllShifts(uid))
+                Log.i("CaptainRepository", "[ShiftSync] Reading canonical captain_schedules/$uid first")
+                val canonicalDoc = firestore.collection("captain_schedules").document(uid).get().await()
+                if (canonicalDoc.exists()) {
+                    val applied = syncShiftsUsingResolvedSources(
+                        uid = uid,
+                        canonicalDocExists = true,
+                        canonicalDocData = canonicalDoc.data
+                    )
+                    lastShiftSyncUid = uid
+                    lastShiftSyncAtMs = System.currentTimeMillis()
+                    return@withLock Result.success(applied)
                 }
-                if (subList.isNotEmpty()) {
-                    candidateLists.add(subList)
-                    Log.d("CaptainRepository", "[ShiftSync] Found ${subList.size} shifts in captain_schedules/$uid/shifts subcollection")
-                }
-            } catch (e: Exception) {
-                Log.w("CaptainRepository", "[ShiftSync] captain_schedules/$uid/shifts subcollection notice: ${e.message}")
-            }
 
-            // 2. Fetch from 'captain_schedules' where captainId == uid
-            try {
-                val querySnap = firestore.collection("captain_schedules").whereEqualTo("captainId", uid).get().await()
-                for (d in querySnap.documents) {
-                    val shifts = d.extractAllShifts(uid)
-                    if (shifts.isNotEmpty()) candidateLists.add(shifts)
+                // Legacy fallback is used only when the canonical admin schedule document is absent.
+                // Run fallback reads in parallel for faster cold start.
+                val candidateLists = mutableListOf<List<ShiftEntity>>()
+                val fallbackResults = coroutineScope {
+                    listOf(
+                        async(Dispatchers.IO) {
+                            runCatching {
+                                val subSnap = firestore.collection("captain_schedules").document(uid).collection("shifts").get().await()
+                                subSnap.documents.flatMap { it.extractAllShifts(uid) }
+                            }.getOrDefault(emptyList())
+                        },
+                        async(Dispatchers.IO) {
+                            runCatching {
+                                firestore.collection("captain_schedules").whereEqualTo("captainId", uid).get().await()
+                                    .documents.flatMap { it.extractAllShifts(uid) }
+                            }.getOrDefault(emptyList())
+                        },
+                        async(Dispatchers.IO) {
+                            runCatching {
+                                firestore.collection("captain_schedules").whereEqualTo("captainUid", uid).get().await()
+                                    .documents.flatMap { it.extractAllShifts(uid) }
+                            }.getOrDefault(emptyList())
+                        },
+                        async(Dispatchers.IO) {
+                            runCatching {
+                                firestore.collection("captain_schedules").whereEqualTo("driverId", uid).get().await()
+                                    .documents.flatMap { it.extractAllShifts(uid) }
+                            }.getOrDefault(emptyList())
+                        },
+                        async(Dispatchers.IO) {
+                            runCatching {
+                                firestore.collection("captains").document(uid).collection("shifts").get().await()
+                                    .documents.flatMap { it.extractAllShifts(uid) }
+                            }.getOrDefault(emptyList())
+                        },
+                        async(Dispatchers.IO) {
+                            runCatching {
+                                val captainDoc = firestore.collection("captains").document(uid).get().await()
+                                if (captainDoc.exists()) captainDoc.extractAllShifts(uid) else emptyList()
+                            }.getOrDefault(emptyList())
+                        }
+                    ).awaitAll()
                 }
-            } catch (e: Exception) {
-                Log.w("CaptainRepository", "[ShiftSync] captain_schedules query notice: ${e.message}")
-            }
+                fallbackResults.filter { it.isNotEmpty() }.forEach { candidateLists.add(it) }
 
-            // 2b. Fetch from 'captain_schedules' where captainUid == uid
-            try {
-                val querySnap = firestore.collection("captain_schedules").whereEqualTo("captainUid", uid).get().await()
-                for (d in querySnap.documents) {
-                    val shifts = d.extractAllShifts(uid)
-                    if (shifts.isNotEmpty()) candidateLists.add(shifts)
-                }
-            } catch (_: Exception) {}
-
-            // 2b-2. Fetch from 'captain_schedules' where driverId == uid
-            try {
-                val querySnap = firestore.collection("captain_schedules").whereEqualTo("driverId", uid).get().await()
-                for (d in querySnap.documents) {
-                    val shifts = d.extractAllShifts(uid)
-                    if (shifts.isNotEmpty()) candidateLists.add(shifts)
-                }
-            } catch (_: Exception) {}
-
-            // 2c. Fetch from 'captains/{uid}/shifts' subcollection
-            try {
-                val subSnap = firestore.collection("captains").document(uid).collection("shifts").get().await()
-                val subList = mutableListOf<ShiftEntity>()
-                for (d in subSnap.documents) {
-                    subList.addAll(d.extractAllShifts(uid))
-                }
-                if (subList.isNotEmpty()) candidateLists.add(subList)
-            } catch (_: Exception) {}
-
-            // 3. Fetch from captain profile document
-            try {
-                val captainDoc = firestore.collection("captains").document(uid).get().await()
-                if (captainDoc.exists()) {
-                    val embedded = captainDoc.extractAllShifts(uid)
-                    if (embedded.isNotEmpty()) {
-                        candidateLists.add(embedded)
-                        Log.d("CaptainRepository", "[ShiftSync] Found ${embedded.size} embedded shifts in captain doc")
+                // Legacy fetch from 'shifts' collection only if no candidates found above
+                if (candidateLists.isEmpty()) {
+                    try {
+                        val legacySnap = firestore.collection("shifts").whereEqualTo("captainId", uid).get().await()
+                        val legacyList = legacySnap.documents.mapNotNull { it.toShiftEntity(uid) }
+                        if (legacyList.isNotEmpty()) candidateLists.add(legacyList)
+                    } catch (e: Exception) {
+                        Log.w("CaptainRepository", "[ShiftSync] Query 'shifts' notice: ${e.message}")
                     }
                 }
+
+                val applied = syncShiftsUsingResolvedSources(
+                    uid = uid,
+                    canonicalDocExists = false,
+                    canonicalDocData = null,
+                    legacyCandidateLists = candidateLists
+                )
+                lastShiftSyncUid = uid
+                lastShiftSyncAtMs = System.currentTimeMillis()
+                Result.success(applied)
             } catch (e: Exception) {
-                Log.w("CaptainRepository", "[ShiftSync] Captain doc fetch notice: ${e.message}")
+                Log.w("CaptainRepository", "[ShiftSync] syncShiftsFromFirestore error: ${e.message}")
+                Result.failure(e)
             }
-
-            // 4. Legacy fetch from 'shifts' collection
-            if (candidateLists.isEmpty()) {
-                try {
-                    val legacySnap = firestore.collection("shifts").whereEqualTo("captainId", uid).get().await()
-                    val legacyList = legacySnap.documents.mapNotNull { it.toShiftEntity(uid) }
-                    if (legacyList.isNotEmpty()) candidateLists.add(legacyList)
-                } catch (e: Exception) {
-                    Log.w("CaptainRepository", "[ShiftSync] Query 'shifts' notice: ${e.message}")
-                }
-            }
-
-            val applied = syncShiftsUsingResolvedSources(
-                uid = uid,
-                canonicalDocExists = false,
-                canonicalDocData = null,
-                legacyCandidateLists = candidateLists
-            )
-            Result.success(applied)
-        } catch (e: Exception) {
-            Log.w("CaptainRepository", "[ShiftSync] syncShiftsFromFirestore error: ${e.message}")
-            Result.failure(e)
         }
     }
 
@@ -2105,9 +2544,8 @@ class CaptainRepository(
         // 7. Start shift schedule listener ONLY; orders listener starts only after server confirms working state.
         if (!hasTestBackendOverride) {
             startRealtimeShiftListener()
-            CoroutineScope(Dispatchers.IO).launch {
-                syncShiftsFromFirestore()
-                syncCaptainOrdersHistoryFromFirestore()
+            repositoryScope.launch {
+                syncRecentOperationalOrdersFromFirestore(forceRefresh = false)
             }
         }
 
@@ -3830,6 +4268,7 @@ class CaptainRepository(
 
         _accountApprovalState.value = null
         _serverConfirmedWorkingSession.value = null
+        clearHistorySyncCaches()
         stopRealtimeShiftListener()
         stopRealtimeOrdersListener()
         context?.let { ctx ->
@@ -4031,8 +4470,7 @@ class CaptainRepository(
     }
 
     suspend fun acceptOrder(orderId: Long): Result<Unit> {
-        val orders = allOrdersFlow.firstOrNull() ?: emptyList()
-        val order = orders.find { it.id == orderId }
+        val order = orderDao.getOrderById(orderId)
             ?: return Result.failure(Exception("الطلب غير موجود"))
 
         val (currentUid, currentPhone) = resolveCaptainUidAndPhone()
@@ -4077,7 +4515,6 @@ class CaptainRepository(
         return if (finalRes.isSuccess) {
             context?.let { CaptainNotificationManager.stopIncomingOrderBell(it, orderDocId) }
             orderDao.markOrderAccepted(orderId, currentUid, System.currentTimeMillis())
-            reconcileDailyWallets()
             Result.success(Unit)
         } else {
             val err = finalRes.exceptionOrNull()
@@ -4102,7 +4539,7 @@ class CaptainRepository(
      * it no longer exists (404 / cancelled on backend).
      */
     suspend fun removeStaleOrder(orderId: Long) {
-        val existing = allOrdersFlow.firstOrNull()?.find { it.id == orderId }
+        val existing = orderDao.getOrderById(orderId)
         context?.let {
             CaptainNotificationManager.stopIncomingOrderBell(
                 it,
@@ -4110,15 +4547,16 @@ class CaptainRepository(
             )
         }
         orderDao.deleteOrderById(orderId)
-        reconcileDailyWallets()
+        if (existing?.status == OrderStatus.DELIVERED) {
+            reconcileDailyWallets()
+        }
     }
 
     /**
      * 2. Arrived at merchant: calls Cloud Function `captainArrivedAtMerchant` (Server-only; zero direct Firestore fallback).
      */
     suspend fun markAtStore(orderId: Long): Result<String> {
-        val orders = allOrdersFlow.firstOrNull() ?: emptyList()
-        val order = orders.find { it.id == orderId }
+        val order = orderDao.getOrderById(orderId)
             ?: return Result.failure(Exception("الطلب غير موجود"))
 
         val (currentUid, currentPhone) = resolveCaptainUidAndPhone()
@@ -4145,8 +4583,7 @@ class CaptainRepository(
      * 3. Confirm pickup from merchant: calls Cloud Function `confirmPickup` (Server-only; zero direct Firestore fallback).
      */
     suspend fun confirmPickup(orderId: Long): Result<String> {
-        val orders = allOrdersFlow.firstOrNull() ?: emptyList()
-        val order = orders.find { it.id == orderId }
+        val order = orderDao.getOrderById(orderId)
             ?: return Result.failure(Exception("الطلب غير موجود"))
 
         val (currentUid, currentPhone) = resolveCaptainUidAndPhone()
@@ -4183,8 +4620,7 @@ class CaptainRepository(
         imageUri: Uri,
         onUploadStateChange: (ImageUploadState) -> Unit = {}
     ): Result<String> {
-        val orders = allOrdersFlow.firstOrNull() ?: emptyList()
-        val order = orders.find { it.id == orderId }
+        val order = orderDao.getOrderById(orderId)
             ?: return Result.failure(IllegalArgumentException("الطلب غير موجود"))
 
         val captainUid = cloudMetadataPort.currentAuthUid()?.takeIf { it.isNotBlank() }
@@ -4254,8 +4690,7 @@ class CaptainRepository(
     }
 
     suspend fun saveOrderDataAndImage(orderId: Long, imageUri: Uri): Result<String> {
-        val orders = allOrdersFlow.firstOrNull() ?: emptyList()
-        val order = orders.find { it.id == orderId }
+        val order = orderDao.getOrderById(orderId)
         val name = order?.customerName ?: "عميل البطل"
         val phone = order?.customerPhone ?: ""
         return saveOrderCustomerData(orderId, name, phone, "", imageUri)
@@ -4267,8 +4702,7 @@ class CaptainRepository(
      * Never updates local order status or wallet if the backend call fails.
      */
     suspend fun completeDelivery(orderId: Long): Result<Double> {
-        val orders = allOrdersFlow.firstOrNull() ?: emptyList()
-        val order = orders.find { it.id == orderId }
+        val order = orderDao.getOrderById(orderId)
             ?: return Result.failure(Exception("الطلب غير موجود"))
 
         if (order.status != OrderStatus.EN_ROUTE) {
@@ -4317,8 +4751,7 @@ class CaptainRepository(
      * as the single source of truth before marking the offer EXPIRED locally.
      */
     suspend fun expireDeliveryOffer(orderId: Long): Result<Unit> {
-        val orders = allOrdersFlow.firstOrNull() ?: emptyList()
-        val order = orders.find { it.id == orderId }
+        val order = orderDao.getOrderById(orderId)
             ?: return Result.failure(Exception("الطلب غير موجود"))
         val orderDocId = resolveCleanOrderDocId(order)
         context?.let { CaptainNotificationManager.stopIncomingOrderBell(it, orderDocId) }
@@ -4341,8 +4774,7 @@ class CaptainRepository(
      * 7. Decline incoming delivery offer via Cloud Function (zero direct Firestore fallback).
      */
     suspend fun declineOrder(orderId: Long): Result<Unit> {
-        val orders = allOrdersFlow.firstOrNull() ?: emptyList()
-        val order = orders.find { it.id == orderId }
+        val order = orderDao.getOrderById(orderId)
             ?: return Result.failure(Exception("الطلب غير موجود"))
         val orderDocId = resolveCleanOrderDocId(order)
         context?.let { CaptainNotificationManager.stopIncomingOrderBell(it, orderDocId) }
@@ -4360,6 +4792,53 @@ class CaptainRepository(
         const val PRESENCE_CALLABLE_TIMEOUT_MS = 10_000L
         const val FIRESTORE_OFFLINE_FALLBACK_TIMEOUT_MS = 5_000L
         const val LOGOUT_NETWORK_TIMEOUT_MS = 3_000L
+
+        const val DEFAULT_ORDERS_LISTENER_CONSUMER = "default"
+        const val ORDERS_LISTENER_CONSUMER_VIEWMODEL = "viewmodel"
+        const val ORDERS_LISTENER_CONSUMER_LOCATION_SERVICE = "location_service"
+        internal const val LISTENER_KEY_PENDING_OFFER = "pending_offer"
+        internal val ORDER_ASSIGNMENT_QUERY_FIELDS = listOf(
+            "captainId",
+            "driverId",
+            "captainUid",
+            "assignedCaptainId"
+        )
+        internal const val HISTORY_SYNC_TTL_MS = 3L * 60L * 1000L
+        internal const val SHIFT_SYNC_DEDUPE_TTL_MS = 30L * 1000L
+        internal const val WALLET_RECONCILE_DEBOUNCE_MS = 800L
+        private const val OVERNIGHT_QUERY_BUFFER_MS = 24L * 60L * 60L * 1000L
+
+        @Volatile
+        private var sharedInstance: CaptainRepository? = null
+
+        /**
+         * Returns the single process-wide [CaptainRepository] bound strictly to [Context.getApplicationContext].
+         * All app components (ViewModel, LocationService, IncomingOrderActivity, IncomingOrderBellService,
+         * ShiftAlarmReceiver) share this instance to avoid duplicate Firestore listeners and cache divergence.
+         */
+        fun getInstance(context: Context): CaptainRepository {
+            val appCtx = context.applicationContext
+            return sharedInstance ?: synchronized(this) {
+                sharedInstance ?: run {
+                    val db = AppDatabase.getDatabase(appCtx)
+                    CaptainRepository(
+                        captainDao = db.captainDao(),
+                        orderDao = db.orderDao(),
+                        shiftDao = db.shiftDao(),
+                        context = appCtx
+                    ).also { sharedInstance = it }
+                }
+            }
+        }
+
+        internal fun resetSharedInstanceForTesting() {
+            synchronized(this) {
+                sharedInstance?.stopRealtimeOrdersListener()
+                sharedInstance?.stopRealtimeShiftListener()
+                sharedInstance?.clearHistorySyncCaches()
+                sharedInstance = null
+            }
+        }
 
         private val fcmTokenSyncMutex = Mutex()
 
@@ -4964,6 +5443,10 @@ data class ResolvedOrderStatus(
     val merchantConfirmed: Boolean
 )
 
+private val DATE_KEY_REGEX = Regex("\\d{4}-\\d{2}-\\d{2}")
+private val WHITESPACE_RUN_REGEX = Regex("\\s+")
+private val UNDERSCORE_RUN_REGEX = Regex("_+")
+
 fun isTruthyConfirmationValue(raw: Any?): Boolean {
     return when (raw) {
         null -> false
@@ -4972,7 +5455,7 @@ fun isTruthyConfirmationValue(raw: Any?): Boolean {
         is Timestamp -> raw.seconds > 0L
         is java.util.Date -> raw.time > 0L
         is String -> {
-            val clean = raw.trim().lowercase().replace("-", "_").replace(Regex("\\s+"), "_")
+            val clean = raw.trim().lowercase().replace("-", "_").replace(WHITESPACE_RUN_REGEX, "_")
             clean in setOf(
                 "true", "1", "yes", "ok", "confirmed", "approved", "accepted",
                 "done", "verified", "نعم", "مؤكد", "تم_التأكيد", "تم_الاعتماد"
@@ -4986,8 +5469,8 @@ private fun normalizeOrderStatusToken(raw: String): String {
     return raw.trim()
         .lowercase()
         .replace('-', '_')
-        .replace(Regex("\\s+"), "_")
-        .replace(Regex("_+"), "_")
+        .replace(WHITESPACE_RUN_REGEX, "_")
+        .replace(UNDERSCORE_RUN_REGEX, "_")
         .trim('_')
 }
 

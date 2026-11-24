@@ -88,12 +88,7 @@ class ShiftAlarmReceiver : BroadcastReceiver() {
             eligibilityCheckerOverride == null ||
             setOnlineStatusOverride == null
         ) {
-            CaptainRepository(
-                captainDao = db.captainDao(),
-                orderDao = db.orderDao(),
-                shiftDao = db.shiftDao(),
-                context = appContext
-            )
+            CaptainRepository.getInstance(appContext)
         } else {
             null
         }

@@ -2,6 +2,7 @@ package com.example.data
 
 import androidx.compose.runtime.Immutable
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 
 enum class OrderStatus {
@@ -35,7 +36,15 @@ fun resolveMerchantImageReference(storeImage: String?, storeImagePath: String?):
 }
 
 @Immutable
-@Entity(tableName = "orders")
+@Entity(
+    tableName = "orders",
+    indices = [
+        Index(value = ["firestoreDocId"]),
+        Index(value = ["status"]),
+        Index(value = ["createdAt"]),
+        Index(value = ["captainId"])
+    ]
+)
 data class OrderEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val orderNumber: String,

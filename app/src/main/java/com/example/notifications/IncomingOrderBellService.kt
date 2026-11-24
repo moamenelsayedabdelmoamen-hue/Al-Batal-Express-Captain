@@ -335,7 +335,11 @@ class IncomingOrderBellService : Service() {
             val byDoc = runCatching { db.orderDao().findByFirestoreDocId(orderKey) }.getOrNull()
             if (byDoc != null) return byDoc
         }
-        val all = runCatching { db.orderDao().getAllOrdersFlow().firstOrNull() }.getOrNull() ?: return null
+        if (orderId > 0L) {
+            val byId = runCatching { db.orderDao().getOrderById(orderId) }.getOrNull()
+            if (byId != null) return byId
+        }
+        val all = runCatching { db.orderDao().getAllOrdersSnapshot() }.getOrNull() ?: return null
         return all.find {
             (orderId > 0L && it.id == orderId) ||
                 (orderKey.isNotBlank() && (it.firestoreDocId == orderKey || it.cleanOrderNumber == orderKey))
@@ -352,12 +356,7 @@ class IncomingOrderBellService : Service() {
         var serverConfirmedTransfer = false
         try {
             if (db != null) {
-                val repo = CaptainRepository(
-                    captainDao = db.captainDao(),
-                    orderDao = db.orderDao(),
-                    shiftDao = db.shiftDao(),
-                    context = applicationContext
-                )
+                val repo = CaptainRepository.getInstance(applicationContext)
                 val targetOrder = findTrackedOrder(db, orderId, orderKey)
                 val resolvedId = targetOrder?.id ?: orderId
                 if (resolvedId > 0L) {

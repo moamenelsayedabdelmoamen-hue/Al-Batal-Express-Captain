@@ -49,13 +49,7 @@ class IncomingOrderActivity : ComponentActivity() {
         configureLockScreenAndWakeFlags()
         enableEdgeToEdge()
 
-        val db = AppDatabase.getDatabase(applicationContext)
-        repository = CaptainRepository(
-            captainDao = db.captainDao(),
-            orderDao = db.orderDao(),
-            shiftDao = db.shiftDao(),
-            context = applicationContext
-        )
+        repository = CaptainRepository.getInstance(applicationContext)
 
         val fallbackOrder = extractFallbackOrderFromIntent(intent)
         val targetOrderKey = intent.getStringExtra(EXTRA_ORDER_KEY).orEmpty()

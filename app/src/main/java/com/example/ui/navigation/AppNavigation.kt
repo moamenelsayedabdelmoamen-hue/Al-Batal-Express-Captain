@@ -138,50 +138,8 @@ fun AppNavigation(
     splashPlaybackMode: SplashVideoPlaybackMode = SplashVideoPlaybackMode.ExoPlayerDefault
 ) {
     val context = LocalContext.current
-    val captain by viewModel.captainState.collectAsStateWithLifecycle()
-    val activeOrder by viewModel.activeOrder.collectAsStateWithLifecycle()
-    val availableOrders by viewModel.availableOrders.collectAsStateWithLifecycle()
-    val pendingOrder by viewModel.pendingIncomingOrder.collectAsStateWithLifecycle()
-    val allOrders by viewModel.allOrders.collectAsStateWithLifecycle()
-    val completedCount by viewModel.completedCount.collectAsStateWithLifecycle()
-    val totalEarnings by viewModel.totalEarnings.collectAsStateWithLifecycle()
-    val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
-    val gpsStatus by viewModel.gpsStatus.collectAsStateWithLifecycle()
-    val currentLocation by viewModel.currentLocation.collectAsStateWithLifecycle()
-
-    val shifts by viewModel.shifts.collectAsStateWithLifecycle()
-    val shiftStatus by viewModel.shiftStatus.collectAsStateWithLifecycle()
-    val currentCairoTime by viewModel.currentCairoTime.collectAsStateWithLifecycle()
-    val currentCairoDate by viewModel.currentCairoDate.collectAsStateWithLifecycle()
-    val dailyWorkHours by viewModel.dailyWorkHours.collectAsStateWithLifecycle()
-    val weeklyWorkHours by viewModel.weeklyWorkHours.collectAsStateWithLifecycle()
-    val isShiftNetworkConnected by viewModel.isShiftNetworkConnected.collectAsStateWithLifecycle()
-
-    val currentOperationalDayKey by viewModel.currentOperationalDayKey.collectAsStateWithLifecycle()
-    val todayCalendarDateKey by viewModel.todayCalendarDateKey.collectAsStateWithLifecycle()
-    val selectedHistoryDateKey by viewModel.selectedHistoryDateKey.collectAsStateWithLifecycle()
-    val selectedHistoryTab by viewModel.selectedHistoryTab.collectAsStateWithLifecycle()
-    val archivedOrdersForSelectedDate by viewModel.archivedOrdersForSelectedDate.collectAsStateWithLifecycle()
-    val captainHistoryOrders by viewModel.captainHistoryOrders.collectAsStateWithLifecycle()
-    val currentDayWalletBalance by viewModel.currentDayWalletBalance.collectAsStateWithLifecycle()
-    val currentDayCompletedCount by viewModel.currentDayCompletedCount.collectAsStateWithLifecycle()
-    val previousDayWalletBalance by viewModel.previousDayWalletBalance.collectAsStateWithLifecycle()
-    val dailyWalletRecords by viewModel.dailyWalletRecords.collectAsStateWithLifecycle()
-    val isSyncingOrdersHistory by viewModel.isSyncingOrdersHistory.collectAsStateWithLifecycle()
-    val historySyncError by viewModel.historySyncError.collectAsStateWithLifecycle()
-
-    val profileUploadState by viewModel.profileUploadState.collectAsStateWithLifecycle()
-    val idFrontUploadState by viewModel.idFrontUploadState.collectAsStateWithLifecycle()
-    val idBackUploadState by viewModel.idBackUploadState.collectAsStateWithLifecycle()
-    val licenseUploadState by viewModel.licenseUploadState.collectAsStateWithLifecycle()
-    val receiptUploadState by viewModel.receiptUploadState.collectAsStateWithLifecycle()
-    val orderActionError by viewModel.orderActionError.collectAsStateWithLifecycle()
-    val pendingNavigateTab by viewModel.pendingNavigateTab.collectAsStateWithLifecycle()
-
     val currentRoute by viewModel.currentRoute.collectAsStateWithLifecycle()
-    val unverifiedEmail by viewModel.unverifiedEmail.collectAsStateWithLifecycle()
-    val accountApproval by viewModel.accountApprovalState.collectAsStateWithLifecycle()
-    val approvalFeedback by viewModel.approvalFeedback.collectAsStateWithLifecycle()
+    val pendingNavigateTab by viewModel.pendingNavigateTab.collectAsStateWithLifecycle()
     var selectedBottomTab by remember { mutableIntStateOf(0) }
 
     LaunchedEffect(pendingNavigateTab) {
@@ -219,27 +177,29 @@ fun AppNavigation(
         }
     }
 
-    val requestLocationPermissionsAction: () -> Unit = {
-        val perms = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            arrayOf(
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.ACCESS_COARSE_LOCATION,
-                Manifest.permission.POST_NOTIFICATIONS
-            )
-        } else {
-            arrayOf(
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.ACCESS_COARSE_LOCATION
-            )
-        }
-        runCatching {
-            locationPermissionLauncher.launch(perms)
-        }.onFailure {
-            Toast.makeText(
-                context,
-                "تعذر فتح نافذة إذن الموقع. يرجى تفعيل الإذن من إعدادات التطبيق.",
-                Toast.LENGTH_LONG
-            ).show()
+    val requestLocationPermissionsAction: () -> Unit = remember(locationPermissionLauncher, context) {
+        {
+            val perms = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION,
+                    Manifest.permission.POST_NOTIFICATIONS
+                )
+            } else {
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
+            }
+            runCatching {
+                locationPermissionLauncher.launch(perms)
+            }.onFailure {
+                Toast.makeText(
+                    context,
+                    "تعذر فتح نافذة إذن الموقع. يرجى تفعيل الإذن من إعدادات التطبيق.",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
         }
     }
 
@@ -282,266 +242,175 @@ fun AppNavigation(
     }
 
     CompositionLocalProvider(LocalStorageRepository provides viewModel.repository.storageRepository) {
-    when (currentRoute) {
-        ScreenRoute.Splash.route -> {
-            SplashScreen(
-                isLoggedIn = captain?.isLoggedIn == true,
-                playbackMode = splashPlaybackMode,
-                // Keep the branded intro, but never let video decoding delay app entry for long.
-                safetyTimeoutMs = 1_200L,
-                onNavigateNext = {
-                    viewModel.onIntroSplashFinished()
-                }
-            )
-        }
-        ScreenRoute.Login.route -> {
-            LoginScreen(
-                isLoading = isLoading,
-                onLoginClick = { phoneOrEmail, pass, onNeedsEmailVerification, onError ->
-                    viewModel.login(
-                        phoneOrEmail = phoneOrEmail,
-                        pass = pass,
-                        onSuccess = { viewModel.navigateTo(ScreenRoute.Main.route) },
-                        onNeedsEmailVerification = { email ->
-                            viewModel.setUnverifiedEmail(email)
-                            onNeedsEmailVerification(email)
-                        },
-                        onAwaitingApproval = {
-                            viewModel.navigateTo(ScreenRoute.AccountApproval.route)
-                        },
-                        onError = onError
-                    )
-                },
-                onNavigateSignUp = { viewModel.navigateTo(ScreenRoute.SignUp.route) },
-                onNavigateVerifyEmail = { email ->
-                    viewModel.setUnverifiedEmail(email)
-                    viewModel.navigateTo(ScreenRoute.VerifyEmail.route)
-                },
-                onForgotPasswordClick = { phoneOrEmail, onSuccess, onError ->
-                    viewModel.sendPasswordReset(phoneOrEmail, onSuccess, onError)
-                }
-            )
-        }
-        ScreenRoute.SignUp.route -> {
-            BackHandler {
-                viewModel.navigateTo(ScreenRoute.Login.route)
+        when (currentRoute) {
+            ScreenRoute.Splash.route -> {
+                val captain by viewModel.captainState.collectAsStateWithLifecycle()
+                SplashScreen(
+                    isLoggedIn = captain?.isLoggedIn == true,
+                    playbackMode = splashPlaybackMode,
+                    // Keep the branded intro, but never let video decoding delay app entry for long.
+                    safetyTimeoutMs = 1_200L,
+                    onNavigateNext = {
+                        viewModel.onIntroSplashFinished()
+                    }
+                )
             }
-            SignUpScreen(
-                isLoading = isLoading,
-                onSignUpClick = { fullName, phone, email, pass, confirmPass, address, avatarUri, avatarIndex, vehicleType, nationalIdUri, idBackUri, licenseUri, onError ->
-                    viewModel.signUp(
-                        fullName = fullName,
-                        phone = phone,
-                        email = email,
-                        pass = pass,
-                        confirmPass = confirmPass,
-                        address = address,
-                        avatarUri = avatarUri,
-                        avatarPresetIndex = avatarIndex,
-                        vehicleType = vehicleType,
-                        nationalIdUri = nationalIdUri,
-                        idBackUri = idBackUri,
-                        licenseUri = licenseUri,
-                        onEmailSent = { sentEmail ->
-                            viewModel.setUnverifiedEmail(sentEmail)
-                            viewModel.navigateTo(ScreenRoute.VerifyEmail.route)
-                        },
-                        onError = onError
-                    )
-                },
-                onNavigateLogin = { viewModel.navigateTo(ScreenRoute.Login.route) }
-            )
-        }
-        ScreenRoute.VerifyEmail.route -> {
-            BackHandler {
-                viewModel.navigateTo(ScreenRoute.Login.route)
+            ScreenRoute.Login.route -> {
+                val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
+                LoginScreen(
+                    isLoading = isLoading,
+                    onLoginClick = { phoneOrEmail, pass, onNeedsEmailVerification, onError ->
+                        viewModel.login(
+                            phoneOrEmail = phoneOrEmail,
+                            pass = pass,
+                            onSuccess = { viewModel.navigateTo(ScreenRoute.Main.route) },
+                            onNeedsEmailVerification = { email ->
+                                viewModel.setUnverifiedEmail(email)
+                                onNeedsEmailVerification(email)
+                            },
+                            onAwaitingApproval = {
+                                viewModel.navigateTo(ScreenRoute.AccountApproval.route)
+                            },
+                            onError = onError
+                        )
+                    },
+                    onNavigateSignUp = { viewModel.navigateTo(ScreenRoute.SignUp.route) },
+                    onNavigateVerifyEmail = { email ->
+                        viewModel.setUnverifiedEmail(email)
+                        viewModel.navigateTo(ScreenRoute.VerifyEmail.route)
+                    },
+                    onForgotPasswordClick = { phoneOrEmail, onSuccess, onError ->
+                        viewModel.sendPasswordReset(phoneOrEmail, onSuccess, onError)
+                    }
+                )
             }
-            EmailVerificationScreen(
-                email = unverifiedEmail.ifBlank { captain?.email ?: "" },
-                onCheckVerification = { onVerified, onNotVerified ->
-                    viewModel.checkEmailVerification(
-                        onVerified = onVerified,
-                        onNotVerified = onNotVerified,
-                        onAwaitingApproval = {
-                            viewModel.navigateTo(ScreenRoute.AccountApproval.route)
-                        }
-                    )
-                },
-                onResendEmail = { onResult ->
-                    viewModel.resendVerificationEmail(onResult)
-                },
-                onNavigateLogin = {
-                    viewModel.navigateTo(ScreenRoute.Login.route)
-                },
-                onVerifiedSuccess = {
-                    viewModel.navigateTo(ScreenRoute.Main.route)
-                }
-            )
-        }
-        ScreenRoute.AccountApproval.route -> {
-            BackHandler {
-                viewModel.logout {
-                    selectedBottomTab = 0
+            ScreenRoute.SignUp.route -> {
+                val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
+                BackHandler {
                     viewModel.navigateTo(ScreenRoute.Login.route)
                 }
+                SignUpScreen(
+                    isLoading = isLoading,
+                    onSignUpClick = { fullName, phone, email, pass, confirmPass, address, avatarUri, avatarIndex, vehicleType, nationalIdUri, idBackUri, licenseUri, onError ->
+                        viewModel.signUp(
+                            fullName = fullName,
+                            phone = phone,
+                            email = email,
+                            pass = pass,
+                            confirmPass = confirmPass,
+                            address = address,
+                            avatarUri = avatarUri,
+                            avatarPresetIndex = avatarIndex,
+                            vehicleType = vehicleType,
+                            nationalIdUri = nationalIdUri,
+                            idBackUri = idBackUri,
+                            licenseUri = licenseUri,
+                            onEmailSent = { sentEmail ->
+                                viewModel.setUnverifiedEmail(sentEmail)
+                                viewModel.navigateTo(ScreenRoute.VerifyEmail.route)
+                            },
+                            onError = onError
+                        )
+                    },
+                    onNavigateLogin = { viewModel.navigateTo(ScreenRoute.Login.route) }
+                )
             }
-            AccountApprovalScreen(
-                approval = accountApproval,
-                isRefreshing = isLoading,
-                statusFeedback = approvalFeedback,
-                onRefreshStatus = {
-                    viewModel.refreshAccountApprovalStatus()
-                },
-                onLogout = {
+            ScreenRoute.VerifyEmail.route -> {
+                val captain by viewModel.captainState.collectAsStateWithLifecycle()
+                val unverifiedEmail by viewModel.unverifiedEmail.collectAsStateWithLifecycle()
+                BackHandler {
+                    viewModel.navigateTo(ScreenRoute.Login.route)
+                }
+                EmailVerificationScreen(
+                    email = unverifiedEmail.ifBlank { captain?.email ?: "" },
+                    onCheckVerification = { onVerified, onNotVerified ->
+                        viewModel.checkEmailVerification(
+                            onVerified = onVerified,
+                            onNotVerified = onNotVerified,
+                            onAwaitingApproval = {
+                                viewModel.navigateTo(ScreenRoute.AccountApproval.route)
+                            }
+                        )
+                    },
+                    onResendEmail = { onResult ->
+                        viewModel.resendVerificationEmail(onResult)
+                    },
+                    onNavigateLogin = {
+                        viewModel.navigateTo(ScreenRoute.Login.route)
+                    },
+                    onVerifiedSuccess = {
+                        viewModel.navigateTo(ScreenRoute.Main.route)
+                    }
+                )
+            }
+            ScreenRoute.AccountApproval.route -> {
+                val accountApproval by viewModel.accountApprovalState.collectAsStateWithLifecycle()
+                val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
+                val approvalFeedback by viewModel.approvalFeedback.collectAsStateWithLifecycle()
+                BackHandler {
                     viewModel.logout {
                         selectedBottomTab = 0
                         viewModel.navigateTo(ScreenRoute.Login.route)
                     }
                 }
-            )
-        }
-        ScreenRoute.Main.route -> {
-            BackHandler(enabled = selectedBottomTab != 0) {
-                selectedBottomTab = 0
-            }
-            Scaffold(
-                modifier = Modifier.fillMaxSize(),
-                bottomBar = {
-                    CaptainBottomNavigationBar(
-                        selectedTabIndex = selectedBottomTab,
-                        onTabSelected = { targetIndex ->
-                            if (targetIndex == 1 && selectedBottomTab != 1) {
-                                viewModel.openOrdersHistoryToday()
-                            }
-                            selectedBottomTab = targetIndex
+                AccountApprovalScreen(
+                    approval = accountApproval,
+                    isRefreshing = isLoading,
+                    statusFeedback = approvalFeedback,
+                    onRefreshStatus = {
+                        viewModel.refreshAccountApprovalStatus()
+                    },
+                    onLogout = {
+                        viewModel.logout {
+                            selectedBottomTab = 0
+                            viewModel.navigateTo(ScreenRoute.Login.route)
                         }
-                    )
+                    }
+                )
+            }
+            ScreenRoute.Main.route -> {
+                BackHandler(enabled = selectedBottomTab != 0) {
+                    selectedBottomTab = 0
                 }
-            ) { innerPadding ->
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(innerPadding)
-                ) {
-                    when (selectedBottomTab) {
-                        0 -> {
-                            DashboardScreen(
-                                captain = captain,
-                                activeOrder = activeOrder,
-                                availableOrders = availableOrders,
-                                pendingIncomingOrder = pendingOrder,
-                                completedCount = currentDayCompletedCount,
-                                totalEarnings = currentDayWalletBalance,
-                                isLoading = isLoading,
-                                gpsStatus = gpsStatus,
-                                currentLocation = currentLocation,
+                Scaffold(
+                    modifier = Modifier.fillMaxSize(),
+                    bottomBar = {
+                        CaptainBottomNavigationBar(
+                            selectedTabIndex = selectedBottomTab,
+                            onTabSelected = { targetIndex ->
+                                if (targetIndex == 1 && selectedBottomTab != 1) {
+                                    viewModel.openOrdersHistoryToday()
+                                }
+                                selectedBottomTab = targetIndex
+                            }
+                        )
+                    }
+                ) { innerPadding ->
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(innerPadding)
+                    ) {
+                        when (selectedBottomTab) {
+                            0 -> DashboardTabRoute(
+                                viewModel = viewModel,
                                 onRequestLocationPermission = requestLocationPermissionsAction,
-                                onToggleOnline = { viewModel.toggleOnlineStatus() },
-                                onAcceptOrder = { viewModel.acceptIncomingOrder(it) },
-                                onTimeoutOrder = { viewModel.expireIncomingOrder(it) },
-                                onMarkArrivedAtMerchant = { viewModel.markArrivedAtStore(it) },
-                                onConfirmPickup = { viewModel.confirmPickup(it) },
-                                onSaveOrderCustomerData = { orderId, name, phone, notes, uri, onSuccess, onError ->
-                                    viewModel.saveOrderCustomerData(orderId, name, phone, notes, uri, onSuccess, onError)
-                                },
-                                receiptUploadState = receiptUploadState,
-                                onResetReceiptUploadState = { viewModel.resetReceiptUploadState() },
-                                orderActionError = orderActionError,
-                                onDismissOrderActionError = { viewModel.dismissOrderActionError() },
-                                onAdvanceOrderStatus = { viewModel.advanceActiveOrderStatus(it) },
-                                onSimulateMerchantConfirm = null,
-                                onRefreshOrders = { viewModel.refreshOrders() },
-                                onRefreshMerchantLocation = { viewModel.refreshMerchantLocationForOrder(it) },
-                                shiftStatus = shiftStatus,
-                                shifts = shifts,
-                                currentCairoTime = currentCairoTime,
-                                currentCairoDate = currentCairoDate,
-                                dailyWorkHours = dailyWorkHours,
-                                weeklyWorkHours = weeklyWorkHours,
-                                isShiftNetworkConnected = isShiftNetworkConnected,
-                                onRefreshShifts = { viewModel.refreshShifts() },
                                 onNavigateToShifts = { selectedBottomTab = 2 }
                             )
-                        }
-                        1 -> {
-                            OrdersScreen(
-                                orders = archivedOrdersForSelectedDate,
-                                captainUid = captain?.uid.orEmpty(),
-                                captainPhone = captain?.phoneNumber.orEmpty(),
-                                selectedDateKey = selectedHistoryDateKey,
-                                todayDateKey = todayCalendarDateKey,
-                                selectedTab = selectedHistoryTab,
-                                isSyncing = isSyncingOrdersHistory,
-                                syncError = historySyncError,
-                                onSelectDateKey = { viewModel.selectHistoryDate(it) },
-                                onReturnToToday = { viewModel.resetHistoryDateToToday() },
-                                onSelectTab = { viewModel.selectHistoryTab(it) },
-                                onSyncHistory = { viewModel.syncOrdersHistory(silentSuccess = false) }
-                            )
-                        }
-                        2 -> {
-                            ShiftsScreen(
-                                shifts = shifts,
-                                shiftStatus = shiftStatus,
-                                currentCairoTime = currentCairoTime,
-                                currentCairoDate = currentCairoDate,
-                                dailyWorkHours = dailyWorkHours,
-                                weeklyWorkHours = weeklyWorkHours,
-                                isShiftNetworkConnected = isShiftNetworkConnected,
-                                isLoading = isLoading,
-                                onRefreshShifts = { viewModel.refreshShifts() }
-                            )
-                        }
-                        3 -> {
-                            WalletScreen(
-                                totalEarnings = totalEarnings,
-                                completedCount = completedCount,
-                                completedOrders = captainHistoryOrders.filter { it.status == OrderStatus.DELIVERED },
-                                currentDayWalletBalance = currentDayWalletBalance,
-                                currentDayCompletedCount = currentDayCompletedCount,
-                                previousDayWalletBalance = previousDayWalletBalance,
-                                currentOperationalDayKey = currentOperationalDayKey,
-                                dailyWalletRecords = dailyWalletRecords,
+                            1 -> OrdersTabRoute(viewModel = viewModel)
+                            2 -> ShiftsTabRoute(viewModel = viewModel)
+                            3 -> WalletTabRoute(
+                                viewModel = viewModel,
                                 onOpenDayInOrders = { dayKey ->
                                     viewModel.selectHistoryDay(dayKey)
                                     selectedBottomTab = 1
                                 }
                             )
-                        }
-                        4 -> {
-                            ProfileScreen(
-                                captain = captain,
-                                profileUploadState = profileUploadState,
-                                idFrontUploadState = idFrontUploadState,
-                                idBackUploadState = idBackUploadState,
-                                licenseUploadState = licenseUploadState,
-                                onUploadProfilePhoto = { uri, onDone ->
-                                    viewModel.uploadCaptainProfilePhoto(uri, onDone)
-                                },
-                                onUploadIdFront = { uri, onDone ->
-                                    viewModel.uploadCaptainIdFront(uri, onDone)
-                                },
-                                onUploadIdBack = { uri, onDone ->
-                                    viewModel.uploadCaptainIdBack(uri, onDone)
-                                },
-                                onUploadLicensePhoto = { uri, onDone ->
-                                    viewModel.uploadCaptainLicensePhoto(uri, onDone)
-                                },
-                                onResetProfileUploadState = { viewModel.resetProfileUploadState() },
-                                onResetIdFrontUploadState = { viewModel.resetIdFrontUploadState() },
-                                onResetIdBackUploadState = { viewModel.resetIdBackUploadState() },
-                                onResetLicenseUploadState = { viewModel.resetLicenseUploadState() },
-                                onSaveProfile = { name, phone, email, vehicle, plate, avatarUri ->
-                                    viewModel.updateProfileInfo(name, phone, email, vehicle, plate, avatarUri)
-                                },
-                                onSaveProfileDetails = { name, phone, email, address, vehicle, plate, avatarUri ->
-                                    viewModel.updateProfileInfo(name, phone, email, vehicle, plate, avatarUri, address)
-                                },
-                                onLogout = {
-                                    viewModel.logout {
-                                        selectedBottomTab = 0
-                                        viewModel.navigateTo(ScreenRoute.Login.route)
-                                    }
+                            4 -> ProfileTabRoute(
+                                viewModel = viewModel,
+                                onLoggedOut = {
+                                    selectedBottomTab = 0
+                                    viewModel.navigateTo(ScreenRoute.Login.route)
                                 }
                             )
                         }
@@ -550,5 +419,193 @@ fun AppNavigation(
             }
         }
     }
+}
+
+@Composable
+private fun DashboardTabRoute(
+    viewModel: CaptainViewModel,
+    onRequestLocationPermission: () -> Unit,
+    onNavigateToShifts: () -> Unit
+) {
+    val captain by viewModel.captainState.collectAsStateWithLifecycle()
+    val activeOrder by viewModel.activeOrder.collectAsStateWithLifecycle()
+    val availableOrders by viewModel.availableOrders.collectAsStateWithLifecycle()
+    val pendingOrder by viewModel.pendingIncomingOrder.collectAsStateWithLifecycle()
+    val currentDayCompletedCount by viewModel.currentDayCompletedCount.collectAsStateWithLifecycle()
+    val currentDayWalletBalance by viewModel.currentDayWalletBalance.collectAsStateWithLifecycle()
+    val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
+    val gpsStatus by viewModel.gpsStatus.collectAsStateWithLifecycle()
+    val currentLocation by viewModel.currentLocation.collectAsStateWithLifecycle()
+    val receiptUploadState by viewModel.receiptUploadState.collectAsStateWithLifecycle()
+    val orderActionError by viewModel.orderActionError.collectAsStateWithLifecycle()
+    val shiftStatus by viewModel.shiftStatus.collectAsStateWithLifecycle()
+    val shifts by viewModel.shifts.collectAsStateWithLifecycle()
+    val currentCairoTime by viewModel.currentCairoTime.collectAsStateWithLifecycle()
+    val currentCairoDate by viewModel.currentCairoDate.collectAsStateWithLifecycle()
+    val dailyWorkHours by viewModel.dailyWorkHours.collectAsStateWithLifecycle()
+    val weeklyWorkHours by viewModel.weeklyWorkHours.collectAsStateWithLifecycle()
+    val isShiftNetworkConnected by viewModel.isShiftNetworkConnected.collectAsStateWithLifecycle()
+
+    DashboardScreen(
+        captain = captain,
+        activeOrder = activeOrder,
+        availableOrders = availableOrders,
+        pendingIncomingOrder = pendingOrder,
+        completedCount = currentDayCompletedCount,
+        totalEarnings = currentDayWalletBalance,
+        isLoading = isLoading,
+        gpsStatus = gpsStatus,
+        currentLocation = currentLocation,
+        onRequestLocationPermission = onRequestLocationPermission,
+        onToggleOnline = { viewModel.toggleOnlineStatus() },
+        onAcceptOrder = { viewModel.acceptIncomingOrder(it) },
+        onTimeoutOrder = { viewModel.expireIncomingOrder(it) },
+        onMarkArrivedAtMerchant = { viewModel.markArrivedAtStore(it) },
+        onConfirmPickup = { viewModel.confirmPickup(it) },
+        onSaveOrderCustomerData = { orderId, name, phone, notes, uri, onSuccess, onError ->
+            viewModel.saveOrderCustomerData(orderId, name, phone, notes, uri, onSuccess, onError)
+        },
+        receiptUploadState = receiptUploadState,
+        onResetReceiptUploadState = { viewModel.resetReceiptUploadState() },
+        orderActionError = orderActionError,
+        onDismissOrderActionError = { viewModel.dismissOrderActionError() },
+        onAdvanceOrderStatus = { viewModel.advanceActiveOrderStatus(it) },
+        onSimulateMerchantConfirm = null,
+        onRefreshOrders = { viewModel.refreshOrders() },
+        onRefreshMerchantLocation = { viewModel.refreshMerchantLocationForOrder(it) },
+        shiftStatus = shiftStatus,
+        shifts = shifts,
+        currentCairoTime = currentCairoTime,
+        currentCairoDate = currentCairoDate,
+        dailyWorkHours = dailyWorkHours,
+        weeklyWorkHours = weeklyWorkHours,
+        isShiftNetworkConnected = isShiftNetworkConnected,
+        onRefreshShifts = { viewModel.refreshShifts() },
+        onNavigateToShifts = onNavigateToShifts
+    )
+}
+
+@Composable
+private fun OrdersTabRoute(viewModel: CaptainViewModel) {
+    val captain by viewModel.captainState.collectAsStateWithLifecycle()
+    val archivedOrdersForSelectedDate by viewModel.archivedOrdersForSelectedDate.collectAsStateWithLifecycle()
+    val selectedHistoryDateKey by viewModel.selectedHistoryDateKey.collectAsStateWithLifecycle()
+    val todayCalendarDateKey by viewModel.todayCalendarDateKey.collectAsStateWithLifecycle()
+    val selectedHistoryTab by viewModel.selectedHistoryTab.collectAsStateWithLifecycle()
+    val isSyncingOrdersHistory by viewModel.isSyncingOrdersHistory.collectAsStateWithLifecycle()
+    val historySyncError by viewModel.historySyncError.collectAsStateWithLifecycle()
+
+    OrdersScreen(
+        orders = archivedOrdersForSelectedDate,
+        captainUid = captain?.uid.orEmpty(),
+        captainPhone = captain?.phoneNumber.orEmpty(),
+        selectedDateKey = selectedHistoryDateKey,
+        todayDateKey = todayCalendarDateKey,
+        selectedTab = selectedHistoryTab,
+        isSyncing = isSyncingOrdersHistory,
+        syncError = historySyncError,
+        onSelectDateKey = { viewModel.selectHistoryDate(it) },
+        onReturnToToday = { viewModel.resetHistoryDateToToday() },
+        onSelectTab = { viewModel.selectHistoryTab(it) },
+        onSyncHistory = { viewModel.syncOrdersHistory(silentSuccess = false, forceRefresh = true) }
+    )
+}
+
+@Composable
+private fun ShiftsTabRoute(viewModel: CaptainViewModel) {
+    val shifts by viewModel.shifts.collectAsStateWithLifecycle()
+    val shiftStatus by viewModel.shiftStatus.collectAsStateWithLifecycle()
+    val currentCairoTime by viewModel.currentCairoTime.collectAsStateWithLifecycle()
+    val currentCairoDate by viewModel.currentCairoDate.collectAsStateWithLifecycle()
+    val dailyWorkHours by viewModel.dailyWorkHours.collectAsStateWithLifecycle()
+    val weeklyWorkHours by viewModel.weeklyWorkHours.collectAsStateWithLifecycle()
+    val isShiftNetworkConnected by viewModel.isShiftNetworkConnected.collectAsStateWithLifecycle()
+    val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
+
+    ShiftsScreen(
+        shifts = shifts,
+        shiftStatus = shiftStatus,
+        currentCairoTime = currentCairoTime,
+        currentCairoDate = currentCairoDate,
+        dailyWorkHours = dailyWorkHours,
+        weeklyWorkHours = weeklyWorkHours,
+        isShiftNetworkConnected = isShiftNetworkConnected,
+        isLoading = isLoading,
+        onRefreshShifts = { viewModel.refreshShifts() }
+    )
+}
+
+@Composable
+private fun WalletTabRoute(
+    viewModel: CaptainViewModel,
+    onOpenDayInOrders: (String) -> Unit
+) {
+    val totalEarnings by viewModel.totalEarnings.collectAsStateWithLifecycle()
+    val completedCount by viewModel.completedCount.collectAsStateWithLifecycle()
+    val captainHistoryOrders by viewModel.captainHistoryOrders.collectAsStateWithLifecycle()
+    val deliveredOrders = remember(captainHistoryOrders) {
+        captainHistoryOrders.filter { it.status == OrderStatus.DELIVERED }
     }
+    val currentDayWalletBalance by viewModel.currentDayWalletBalance.collectAsStateWithLifecycle()
+    val currentDayCompletedCount by viewModel.currentDayCompletedCount.collectAsStateWithLifecycle()
+    val previousDayWalletBalance by viewModel.previousDayWalletBalance.collectAsStateWithLifecycle()
+    val currentOperationalDayKey by viewModel.currentOperationalDayKey.collectAsStateWithLifecycle()
+    val dailyWalletRecords by viewModel.dailyWalletRecords.collectAsStateWithLifecycle()
+
+    WalletScreen(
+        totalEarnings = totalEarnings,
+        completedCount = completedCount,
+        completedOrders = deliveredOrders,
+        currentDayWalletBalance = currentDayWalletBalance,
+        currentDayCompletedCount = currentDayCompletedCount,
+        previousDayWalletBalance = previousDayWalletBalance,
+        currentOperationalDayKey = currentOperationalDayKey,
+        dailyWalletRecords = dailyWalletRecords,
+        onOpenDayInOrders = onOpenDayInOrders
+    )
+}
+
+@Composable
+private fun ProfileTabRoute(
+    viewModel: CaptainViewModel,
+    onLoggedOut: () -> Unit
+) {
+    val captain by viewModel.captainState.collectAsStateWithLifecycle()
+    val profileUploadState by viewModel.profileUploadState.collectAsStateWithLifecycle()
+    val idFrontUploadState by viewModel.idFrontUploadState.collectAsStateWithLifecycle()
+    val idBackUploadState by viewModel.idBackUploadState.collectAsStateWithLifecycle()
+    val licenseUploadState by viewModel.licenseUploadState.collectAsStateWithLifecycle()
+
+    ProfileScreen(
+        captain = captain,
+        profileUploadState = profileUploadState,
+        idFrontUploadState = idFrontUploadState,
+        idBackUploadState = idBackUploadState,
+        licenseUploadState = licenseUploadState,
+        onUploadProfilePhoto = { uri, onDone ->
+            viewModel.uploadCaptainProfilePhoto(uri, onDone)
+        },
+        onUploadIdFront = { uri, onDone ->
+            viewModel.uploadCaptainIdFront(uri, onDone)
+        },
+        onUploadIdBack = { uri, onDone ->
+            viewModel.uploadCaptainIdBack(uri, onDone)
+        },
+        onUploadLicensePhoto = { uri, onDone ->
+            viewModel.uploadCaptainLicensePhoto(uri, onDone)
+        },
+        onResetProfileUploadState = { viewModel.resetProfileUploadState() },
+        onResetIdFrontUploadState = { viewModel.resetIdFrontUploadState() },
+        onResetIdBackUploadState = { viewModel.resetIdBackUploadState() },
+        onResetLicenseUploadState = { viewModel.resetLicenseUploadState() },
+        onSaveProfile = { name, phone, email, vehicle, plate, avatarUri ->
+            viewModel.updateProfileInfo(name, phone, email, vehicle, plate, avatarUri)
+        },
+        onSaveProfileDetails = { name, phone, email, address, vehicle, plate, avatarUri ->
+            viewModel.updateProfileInfo(name, phone, email, vehicle, plate, avatarUri, address)
+        },
+        onLogout = {
+            viewModel.logout(onLoggedOut)
+        }
+    )
 }

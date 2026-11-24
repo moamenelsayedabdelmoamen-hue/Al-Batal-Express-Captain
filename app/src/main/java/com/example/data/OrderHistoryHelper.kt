@@ -31,6 +31,7 @@ object OrderHistoryHelper {
 
     val LOCAL_TZ: TimeZone = TimeZone.getTimeZone("Africa/Cairo")
     private val UTC_TZ: TimeZone = TimeZone.getTimeZone("UTC")
+    private val DATE_KEY_REGEX = Regex("\\d{4}-\\d{2}-\\d{2}")
 
     fun getTodayDateKey(nowMs: Long = System.currentTimeMillis()): String {
         val cal = Calendar.getInstance(LOCAL_TZ)
@@ -43,7 +44,7 @@ object OrderHistoryHelper {
     }
 
     fun clampToMaxToday(dateKey: String, todayKey: String = getTodayDateKey()): String {
-        if (!dateKey.matches(Regex("\\d{4}-\\d{2}-\\d{2}"))) return todayKey
+        if (!DATE_KEY_REGEX.matches(dateKey)) return todayKey
         return if (dateKey > todayKey) todayKey else dateKey
     }
 

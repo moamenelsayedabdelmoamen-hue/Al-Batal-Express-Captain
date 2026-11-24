@@ -722,9 +722,13 @@ private fun ArchivedOrderHistoryCard(
     val isDelivered = order.status == OrderStatus.DELIVERED
     val statusLabel = if (isDelivered) "مكتمل" else "ملغي"
     val statusColor = if (isDelivered) StatusOnlineGreen else ExpressRed
-    val finishTimestamp = OrderHistoryHelper.getFinishTimestamp(order)
+    val finishTimestamp = remember(order.id, order.status, order.completedAt, order.cancelledAt, order.acceptedAt, order.createdAt) {
+        OrderHistoryHelper.getFinishTimestamp(order)
+    }
     val finishTimeLabel = if (isDelivered) "وقت الإكمال" else "وقت الإلغاء"
-    val formattedFinishTime = OrderHistoryHelper.formatFinishDateTimeArabic(finishTimestamp)
+    val formattedFinishTime = remember(finishTimestamp) {
+        OrderHistoryHelper.formatFinishDateTimeArabic(finishTimestamp)
+    }
     val cancelReason = order.effectiveCancellationReason.trim()
     val hasCustomerAddress = order.deliveryAddress.isNotBlank() && order.deliveryAddress != "عنوان العميل"
     val hasCustomerInfo = (order.customerName.isNotBlank() && order.customerName != "عميل البطل") ||

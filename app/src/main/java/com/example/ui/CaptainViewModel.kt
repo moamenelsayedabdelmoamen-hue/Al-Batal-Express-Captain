@@ -42,6 +42,7 @@ import com.google.firebase.firestore.ListenerRegistration
 import com.google.firebase.functions.FirebaseFunctionsException
 import java.io.IOException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -54,6 +55,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -77,8 +79,7 @@ data class OrderActionError(
 )
 
 class CaptainViewModel(application: Application) : AndroidViewModel(application) {
-    private val db = AppDatabase.getDatabase(application)
-    val repository = CaptainRepository(db.captainDao(), db.orderDao(), db.shiftDao(), application.applicationContext)
+    val repository = CaptainRepository.getInstance(application.applicationContext)
 
     private fun ensureFirebaseInitialized(): Boolean {
         return runCatching {
@@ -101,7 +102,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         } else null
     }
     private var shiftDocListener: ListenerRegistration? = null
-    private var accountStatusListener: ListenerRegistration? = null
+    private var attachedShiftUid: String? = null
     private var authStateListener: FirebaseAuth.AuthStateListener? = null
 
     val captainState: StateFlow<CaptainEntity?> = repository.captainFlow
@@ -132,15 +133,27 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
     private val _shiftStatus = MutableStateFlow<ShiftStatus>(ShiftStatus.NoSchedule())
     val shiftStatus: StateFlow<ShiftStatus> = _shiftStatus.asStateFlow()
 
+    // Decouples boolean shift eligibility from the 1-second countdown ticker inside ShiftStatus
+    // so order/notification/eligibility flows only re-evaluate when shift state actually transitions.
+    private val shiftAllowsOrdersFlow = _shiftStatus
+        .map { it.isAvailableForOrders }
+        .distinctUntilChanged()
+
     val isShiftNetworkConnected: StateFlow<Boolean> = repository.isShiftNetworkConnected
     val isShiftSynced: StateFlow<Boolean> = repository.isShiftSynced
 
-    val weeklyWorkHours: StateFlow<Double> = shifts.map { ShiftManager.calculateWeeklyWorkHours(it) }
+    val weeklyWorkHours: StateFlow<Double> = shifts
+        .map { ShiftManager.calculateWeeklyWorkHours(it) }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.Default)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
 
     val dailyWorkHours: StateFlow<Double> = combine(shifts, _currentCairoDate) { list, _ ->
         calculateDailyWorkHours(list)
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
+    }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.Default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
 
     val activeOrder: StateFlow<OrderEntity?> = repository.activeOrderFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
@@ -150,22 +163,28 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
     val availableOrders: StateFlow<List<OrderEntity>> = combine(
         repository.availableOrdersFlow,
         captainState,
-        _shiftStatus
-    ) { orders, captain, status ->
+        shiftAllowsOrdersFlow
+    ) { orders, captain, shiftAllows ->
         val isOnline = captain?.isOnline == true
-        val isAccountActive = captain?.status?.trim()?.lowercase() !in listOf("banned", "suspended", "disabled", "blocked", "pending", "inactive")
-        if (isOnline && isAccountActive && status.isAvailableForOrders) orders else emptyList()
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+        val isAccountActive = captain?.status?.trim()?.lowercase() !in INACTIVE_ACCOUNT_STATUSES
+        if (isOnline && isAccountActive && shiftAllows) orders else emptyList()
+    }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.Default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val pendingIncomingOrder: StateFlow<OrderEntity?> = combine(
         repository.pendingOrderFlow,
         captainState,
-        _shiftStatus
-    ) { order, captain, status ->
+        shiftAllowsOrdersFlow
+    ) { order, captain, shiftAllows ->
         val isOnline = captain?.isOnline == true
-        val isAccountActive = captain?.status?.trim()?.lowercase() !in listOf("banned", "suspended", "disabled", "blocked", "pending", "inactive")
-        if (isOnline && isAccountActive && status.isAvailableForOrders) order else null
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+        val isAccountActive = captain?.status?.trim()?.lowercase() !in INACTIVE_ACCOUNT_STATUSES
+        if (isOnline && isAccountActive && shiftAllows) order else null
+    }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.Default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
     val allOrders: StateFlow<List<OrderEntity>> = repository.allOrdersFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -173,33 +192,35 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
     val completedOrders: StateFlow<List<OrderEntity>> = repository.completedOrdersFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    val completedCount: StateFlow<Int> = combine(
+    private val captainDeliveredSummary: StateFlow<Pair<Int, Double>> = combine(
         allOrders,
         captainState
     ) { orders, captain ->
         val uid = auth?.currentUser?.uid ?: captain?.uid ?: ""
         val phone = captain?.phoneNumber ?: ""
-        val fromOrders = orders.count {
-            it.status == OrderStatus.DELIVERED &&
-                DailyWalletManager.isCaptainOwnOrder(it, uid, phone)
-        }
-        maxOf(fromOrders, captain?.totalOrdersCount ?: 0)
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
-
-    val totalEarnings: StateFlow<Double> = combine(
-        allOrders,
-        captainState
-    ) { orders, captain ->
-        val uid = auth?.currentUser?.uid ?: captain?.uid ?: ""
-        val phone = captain?.phoneNumber ?: ""
-        val fromOrders = orders
-            .filter {
-                it.status == OrderStatus.DELIVERED &&
-                    DailyWalletManager.isCaptainOwnOrder(it, uid, phone)
+        var count = 0
+        var sum = 0.0
+        for (order in orders) {
+            if (order.status == OrderStatus.DELIVERED && DailyWalletManager.isCaptainOwnOrder(order, uid, phone)) {
+                count++
+                sum += order.deliveryFee
             }
-            .sumOf { it.deliveryFee }
-        maxOf(fromOrders, captain?.walletBalance ?: 0.0)
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
+        }
+        maxOf(count, captain?.totalOrdersCount ?: 0) to maxOf(sum, captain?.walletBalance ?: 0.0)
+    }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.Default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0 to 0.0)
+
+    val completedCount: StateFlow<Int> = captainDeliveredSummary
+        .map { it.first }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
+
+    val totalEarnings: StateFlow<Double> = captainDeliveredSummary
+        .map { it.second }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
 
     // --- 1:00 PM Daily Wallet Rollover & Archived Order History Date Selection ---
     private val _currentOperationalDayKey = MutableStateFlow(DailyWalletManager.getOperationalDayKey())
@@ -237,7 +258,10 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         orders
             .filter { DailyWalletManager.isCaptainOwnOrder(it, uid, phone) }
             .sortedByDescending { DailyWalletManager.getOrderEffectiveTimestamp(it) }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.Default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     /**
      * Archived finished orders (strictly DELIVERED and CANCELLED) for the logged-in captain
@@ -257,26 +281,35 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
             captainPhone = phone,
             selectedDateKey = dateKey
         )
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.Default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val filteredHistoryOrders: StateFlow<List<OrderEntity>> = combine(
         archivedOrdersForSelectedDate,
         _selectedHistoryTab
     ) { dateOrders, tab ->
         OrderHistoryHelper.filterByTab(dateOrders, tab)
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.Default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val historySummaryStats: StateFlow<OrderHistorySummaryStats> = combine(
         archivedOrdersForSelectedDate,
         _selectedHistoryTab
     ) { dateOrders, tab ->
         OrderHistoryHelper.computeSummaryStats(dateOrders, tab)
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), OrderHistorySummaryStats(0, 0, 0))
+    }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.Default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), OrderHistorySummaryStats(0, 0, 0))
 
     val selectedDayOrders: StateFlow<List<OrderEntity>> = archivedOrdersForSelectedDate
 
-    // Current day wallet balance: real delivery fees earned today (operational day or today's calendar date)
-    val currentDayWalletBalance: StateFlow<Double> = combine(
+    // Single combined calculation for today's wallet balance and delivered order count on Dispatchers.Default
+    private val currentDayWalletSummary: StateFlow<Pair<Double, Int>> = combine(
         allOrders,
         captainState,
         _currentOperationalDayKey
@@ -284,37 +317,36 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         val uid = auth?.currentUser?.uid ?: captain?.uid ?: ""
         val phone = captain?.phoneNumber ?: ""
         val todayCalendarKey = DailyWalletManager.getCalendarDateKey(System.currentTimeMillis())
-
-        orders
-            .filter { order ->
-                order.status == OrderStatus.DELIVERED &&
-                    DailyWalletManager.isCaptainOwnOrder(order, uid, phone) &&
-                    (
-                        DailyWalletManager.getOrderOperationalDayKey(order) == currentDayKey ||
-                        DailyWalletManager.getCalendarDateKey(DailyWalletManager.getOrderEffectiveTimestamp(order)) == todayCalendarKey
-                    )
-            }
-            .sumOf { it.deliveryFee }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
-
-    val currentDayCompletedCount: StateFlow<Int> = combine(
-        allOrders,
-        captainState,
-        _currentOperationalDayKey
-    ) { orders, captain, currentDayKey ->
-        val uid = auth?.currentUser?.uid ?: captain?.uid ?: ""
-        val phone = captain?.phoneNumber ?: ""
-        val todayCalendarKey = DailyWalletManager.getCalendarDateKey(System.currentTimeMillis())
-
-        orders.count { order ->
-            order.status == OrderStatus.DELIVERED &&
+        var sum = 0.0
+        var count = 0
+        for (order in orders) {
+            if (order.status == OrderStatus.DELIVERED &&
                 DailyWalletManager.isCaptainOwnOrder(order, uid, phone) &&
                 (
                     DailyWalletManager.getOrderOperationalDayKey(order) == currentDayKey ||
-                    DailyWalletManager.getCalendarDateKey(DailyWalletManager.getOrderEffectiveTimestamp(order)) == todayCalendarKey
-                )
+                        DailyWalletManager.getCalendarDateKey(DailyWalletManager.getOrderEffectiveTimestamp(order)) == todayCalendarKey
+                    )
+            ) {
+                sum += order.deliveryFee
+                count++
+            }
         }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
+        sum to count
+    }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.Default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0 to 0)
+
+    // Current day wallet balance: real delivery fees earned today (operational day or today's calendar date)
+    val currentDayWalletBalance: StateFlow<Double> = currentDayWalletSummary
+        .map { it.first }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
+
+    val currentDayCompletedCount: StateFlow<Int> = currentDayWalletSummary
+        .map { it.second }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
 
     // Previous operational day's archived wallet balance (recorded at 1:00 PM rollover)
     val previousDayWalletBalance: StateFlow<Double> = combine(
@@ -334,7 +366,10 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         } else {
             records.find { it.dayKey == prevKey }?.walletBalance ?: 0.0
         }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
+    }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.Default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
 
     val selectedDayWalletBalance: StateFlow<Double> = combine(
         captainHistoryOrders,
@@ -362,7 +397,10 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                 records.find { it.dayKey == selectedKey }?.walletBalance ?: 0.0
             }
         }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
+    }
+        .distinctUntilChanged()
+        .flowOn(Dispatchers.Default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
 
     private val _eventFlow = MutableSharedFlow<UiEvent>()
     val eventFlow: SharedFlow<UiEvent> = _eventFlow.asSharedFlow()
@@ -484,11 +522,11 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                 delay(1000L)
             }
         }
-        // Auto-sync shifts, historical orders & FCM token on launch/initialization only for verified users
-        viewModelScope.launch {
+        // Auto-sync shifts, operational-day orders & FCM token on launch/initialization off Main Thread
+        viewModelScope.launch(Dispatchers.IO) {
             repository.reconcileDailyWallets()
             if (auth?.currentUser?.isEmailVerified == true) {
-                val syncRes = repository.syncShiftsFromFirestore()
+                val syncRes = repository.syncShiftsFromFirestore(forceRefresh = false)
                 if (syncRes.isSuccess) {
                     val synced = syncRes.getOrDefault(emptyList())
                     _liveShifts.value = synced
@@ -496,7 +534,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                     _shiftStatus.value = ShiftManager.calculateShiftStatus(synced)
                 }
                 repository.syncFcmToken()
-                repository.syncCaptainOrdersHistoryFromFirestore()
+                repository.syncRecentOperationalOrdersFromFirestore(forceRefresh = false)
             }
         }
         // Keep persistent AlarmManager shift start/end notifications synced with latest schedule
@@ -515,38 +553,40 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         }
         // Notify captain immediately with continuous bell + 60s countdown when a new eligible order arrives
         viewModelScope.launch {
-            combine(availableOrders, pendingIncomingOrder, captainState, _shiftStatus) { avail, incoming, captain, status ->
+            combine(availableOrders, pendingIncomingOrder, captainState, shiftAllowsOrdersFlow) { avail, incoming, captain, shiftAllows ->
                 val canNotify = captain?.isLoggedIn == true &&
                     captain.isOnline &&
-                    status.isAvailableForOrders
+                    shiftAllows
                 if (canNotify) {
                     (avail + listOfNotNull(incoming)).distinctBy { it.id }
                 } else {
                     emptyList()
                 }
-            }.collect { eligiblePendingOrders ->
-                if (eligiblePendingOrders.isEmpty()) {
-                    CaptainNotificationManager.stopIncomingOrderBell(appContext)
-                } else {
-                    for (order in eligiblePendingOrders) {
-                        val orderKey = order.firestoreDocId.ifBlank { order.id.toString() }
-                        CaptainNotificationManager.showNewOrderNotification(
-                            context = appContext,
-                            orderKey = orderKey,
-                            storeName = order.storeName,
-                            pickupAddress = order.pickupAddress,
-                            deliveryAddress = order.deliveryAddress,
-                            deliveryFee = order.deliveryFee,
-                            orderCode = order.cleanOrderCode,
-                            storeLocationUrl = order.effectiveStoreLocationUrl,
-                            orderId = order.id,
-                            offerExpiresAtMs = order.offerExpiresAt,
-                            distanceKm = order.distanceKm,
-                            startContinuousBell = true
-                        )
+            }
+                .distinctUntilChanged()
+                .collect { eligiblePendingOrders ->
+                    if (eligiblePendingOrders.isEmpty()) {
+                        CaptainNotificationManager.stopIncomingOrderBell(appContext)
+                    } else {
+                        for (order in eligiblePendingOrders) {
+                            val orderKey = order.firestoreDocId.ifBlank { order.id.toString() }
+                            CaptainNotificationManager.showNewOrderNotification(
+                                context = appContext,
+                                orderKey = orderKey,
+                                storeName = order.storeName,
+                                pickupAddress = order.pickupAddress,
+                                deliveryAddress = order.deliveryAddress,
+                                deliveryFee = order.deliveryFee,
+                                orderCode = order.cleanOrderCode,
+                                storeLocationUrl = order.effectiveStoreLocationUrl,
+                                orderId = order.id,
+                                offerExpiresAtMs = order.offerExpiresAt,
+                                distanceKm = order.distanceKm,
+                                startContinuousBell = true
+                            )
+                        }
                     }
                 }
-            }
         }
         // Watchdog: enforce 60-second expiry + transfer to nearest captain even if alert dialog isn't mounted
         viewModelScope.launch {
@@ -568,16 +608,16 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             combine(
                 captainState,
-                _shiftStatus,
+                shiftAllowsOrdersFlow,
                 shifts,
                 repository.serverConfirmedWorkingSession
-            ) { captain, status, shiftList, confirmedSession ->
+            ) { captain, shiftAllowsNow, shiftList, confirmedSession ->
                 if (captain == null) {
                     null
                 } else {
                     val online = captain.isOnline
                     val accountActive = captain.status.trim().lowercase() !in listOf("banned", "suspended", "disabled", "blocked", "pending", "inactive", "rejected")
-                    val shiftAllows = if (shiftList.isNotEmpty()) status.isAvailableForOrders else false
+                    val shiftAllows = if (shiftList.isNotEmpty()) shiftAllowsNow else false
                     val serverWorkingConfirmed = confirmedSession != null &&
                         confirmedSession.isConfirmedWorking &&
                         confirmedSession.uid == captain.uid
@@ -591,8 +631,13 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                         repository.stopRealtimeOrdersListener()
                         repository.clearPendingOrdersLocally()
                     } else if (isEligible == true && auth?.currentUser?.isEmailVerified == true) {
-                        runCatching { repository.startRealtimeOrdersListener() }
-                        repository.syncOrdersDetailedFromFirestore()
+                        // Realtime listener delivers the initial snapshot immediately via documentChanges;
+                        // avoid firing a redundant parallel full sync right after attaching listeners.
+                        runCatching {
+                            repository.startRealtimeOrdersListener(
+                                CaptainRepository.ORDERS_LISTENER_CONSUMER_VIEWMODEL
+                            )
+                        }
                     }
                 }
         }
@@ -605,9 +650,9 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                 val endedKey = previousActiveKey
                 previousActiveKey = currentKey
                 if (endedKey == null || endedKey == currentKey) return@collect
-                val ended = repository.allOrdersFlow.first().find {
-                    it.firestoreDocId == endedKey || it.id.toString() == endedKey
-                } ?: return@collect
+                val ended = repository.orderDao.findByFirestoreDocId(endedKey)
+                    ?: endedKey.toLongOrNull()?.let { repository.orderDao.getOrderById(it) }
+                    ?: return@collect
                 if (ended.status != OrderStatus.CANCELLED) return@collect
                 CaptainNotificationManager.showActiveOrderCancelledNotification(
                     context = appContext,
@@ -812,17 +857,19 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                                         is LocationEligibilityResult.Eligible -> {
                                             workingTransitionConfirmed = true
                                             CaptainLocationTracker.startServiceSafely(appContext)
-                                            runCatching { repository.startRealtimeOrdersListener() }
-                                            try {
-                                                if (tickerSyncOrdersOverride != null) {
+                                            runCatching {
+                                                repository.startRealtimeOrdersListener(
+                                                    CaptainRepository.ORDERS_LISTENER_CONSUMER_VIEWMODEL
+                                                )
+                                            }
+                                            if (tickerSyncOrdersOverride != null) {
+                                                try {
                                                     tickerSyncOrdersOverride!!.invoke()
-                                                } else {
-                                                    repository.syncOrdersDetailedFromFirestore()
+                                                } catch (cancelled: CancellationException) {
+                                                    throw cancelled
+                                                } catch (e: Exception) {
+                                                    Log.w("CaptainViewModel", "Order sync override after shift start failed: ${e.message}")
                                                 }
-                                            } catch (cancelled: CancellationException) {
-                                                throw cancelled
-                                            } catch (e: Exception) {
-                                                Log.w("CaptainViewModel", "Order sync after shift start failed: ${e.message}")
                                             }
                                         }
                                         is LocationEligibilityResult.NetworkError -> {
@@ -839,7 +886,11 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                             }
                         } else if (alreadyWorking) {
                             // Re-open a previously working session without asking the captain to confirm again.
-                            runCatching { repository.startRealtimeOrdersListener() }
+                            runCatching {
+                                repository.startRealtimeOrdersListener(
+                                    CaptainRepository.ORDERS_LISTENER_CONSUMER_VIEWMODEL
+                                )
+                            }
                             if (!CaptainLocationTracker.isTracking.value &&
                                 CaptainLocationTracker.hasLocationPermission(appContext) &&
                                 CaptainLocationTracker.isGpsProviderEnabled(appContext)
@@ -982,7 +1033,11 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
             }
             when (val eligibility = repository.checkLocationTrackingEligibility()) {
                 is LocationEligibilityResult.Eligible -> {
-                    runCatching { repository.startRealtimeOrdersListener() }
+                    runCatching {
+                        repository.startRealtimeOrdersListener(
+                            CaptainRepository.ORDERS_LISTENER_CONSUMER_VIEWMODEL
+                        )
+                    }
                     CaptainLocationTracker.startServiceSafely(app)
                 }
                 is LocationEligibilityResult.Ineligible -> {
@@ -1082,12 +1137,15 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun syncOrdersHistory(silentSuccess: Boolean = false) {
+    fun syncOrdersHistory(silentSuccess: Boolean = false, forceRefresh: Boolean = !silentSuccess) {
         viewModelScope.launch {
             _isSyncingOrdersHistory.value = true
             _historySyncError.value = null
             val targetDate = _selectedHistoryDateKey.value
-            val res = repository.syncCaptainArchivedOrdersForDate(targetDate)
+            val res = repository.syncCaptainArchivedOrdersForDate(
+                dateKey = targetDate,
+                forceRefresh = forceRefresh
+            )
             _isSyncingOrdersHistory.value = false
             if (res.isSuccess) {
                 if (!silentSuccess) {
@@ -1158,7 +1216,11 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
             when (val eligibility = tickerLocationEligibilityOverride?.invoke() ?: repository.checkLocationTrackingEligibility()) {
                 is LocationEligibilityResult.Eligible -> {
                     val startResult = CaptainLocationTracker.startServiceSafely(app)
-                    runCatching { repository.startRealtimeOrdersListener() }
+                    runCatching {
+                        repository.startRealtimeOrdersListener(
+                            CaptainRepository.ORDERS_LISTENER_CONSUMER_VIEWMODEL
+                        )
+                    }
                     if (tickerSyncOrdersOverride != null) {
                         try {
                             tickerSyncOrdersOverride?.invoke()
@@ -1166,14 +1228,6 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                             throw cancelled
                         } catch (e: Exception) {
                             Log.w("CaptainViewModel", "Order sync override after starting work failed: ${e.message}")
-                        }
-                    } else if (auth?.currentUser?.isEmailVerified == true) {
-                        try {
-                            repository.syncOrdersDetailedFromFirestore()
-                        } catch (cancelled: CancellationException) {
-                            throw cancelled
-                        } catch (e: Exception) {
-                            Log.w("CaptainViewModel", "Order sync after starting work failed: ${e.message}")
                         }
                     }
                     when (startResult) {
@@ -1993,7 +2047,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
     fun refreshShifts(onResult: (Boolean, String) -> Unit = { _, _ -> }) {
         viewModelScope.launch {
             _isLoading.value = true
-            val res = repository.syncShiftsFromFirestore()
+            val res = repository.syncShiftsFromFirestore(forceRefresh = true)
             _isLoading.value = false
             if (res.isSuccess) {
                 val syncedShifts = res.getOrDefault(emptyList())
@@ -2433,12 +2487,18 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                 if (snapshot == null) return@addSnapshotListener
                 val isFromCache = snapshot.metadata.isFromCache
                 val docData = if (snapshot.exists()) snapshot.data else null
+                val remoteStatus = snapshot.takeIf { it.exists() }
+                    ?.getString("status")?.trim()?.lowercase()
+                    ?.takeIf { it.isNotBlank() }
                 viewModelScope.launch {
                     applyLiveAccountApprovalSnapshot(
                         uid = uid,
                         docData = docData,
                         isFromCache = isFromCache
                     )
+                    if (remoteStatus != null) {
+                        onRemoteAccountStatus(remoteStatus)
+                    }
                 }
             }
     }
@@ -2470,8 +2530,10 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun attachShiftSnapshotListeners(uid: String) {
+        if (attachedShiftUid == uid && shiftDocListener != null) return
         detachShiftSnapshotListeners()
         val dbFirestore = firestore ?: return
+        attachedShiftUid = uid
         Log.i("CaptainViewModel", "[ShiftSnapshotListener] Attaching canonical Firestore listener for UID: $uid (target: captain_schedules/$uid)")
 
         // Canonical single source of truth: captain_schedules/{uid}
@@ -2492,25 +2554,13 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                     )
                 }
             }
-
-        accountStatusListener = dbFirestore.collection("captains").document(uid)
-            .addSnapshotListener { snapshot, error ->
-                if (error != null) {
-                    Log.w("CaptainViewModel", "[CaptainDocListener] captains/$uid error: ${error.message}")
-                    return@addSnapshotListener
-                }
-                val remoteStatus = snapshot?.takeIf { it.exists() }
-                    ?.getString("status")?.trim()?.lowercase()
-                    ?.takeIf { it.isNotBlank() } ?: return@addSnapshotListener
-                viewModelScope.launch { onRemoteAccountStatus(remoteStatus) }
-            }
+        // Note: captains/{uid} account status updates are handled by the single unified captainApprovalDocListener.
     }
 
     fun detachShiftSnapshotListeners() {
         shiftDocListener?.remove()
         shiftDocListener = null
-        accountStatusListener?.remove()
-        accountStatusListener = null
+        attachedShiftUid = null
         _liveShifts.value = emptyList()
         _hasLiveShiftSnapshot.value = false
         _shiftStatus.value = ShiftStatus.NoSchedule()
@@ -2520,6 +2570,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         super.onCleared()
         detachCaptainApprovalListener()
         detachShiftSnapshotListeners()
+        repository.releaseOrdersListener(CaptainRepository.ORDERS_LISTENER_CONSUMER_VIEWMODEL)
         authStateListener?.let { listener ->
             runCatching { auth?.removeAuthStateListener(listener) }
         }

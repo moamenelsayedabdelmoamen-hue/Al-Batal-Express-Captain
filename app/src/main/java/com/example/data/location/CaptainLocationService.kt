@@ -53,13 +53,7 @@ class CaptainLocationService : Service() {
 
         if (eligibilityCheckerOverride == null && locationUploaderOverride == null) {
             try {
-                val db = AppDatabase.getDatabase(applicationContext)
-                repository = CaptainRepository(
-                    captainDao = db.captainDao(),
-                    orderDao = db.orderDao(),
-                    shiftDao = db.shiftDao(),
-                    context = applicationContext
-                )
+                repository = CaptainRepository.getInstance(applicationContext)
             } catch (e: Exception) {
                 Log.e(TAG, "Error initializing repository in service", e)
             }
@@ -259,7 +253,11 @@ class CaptainLocationService : Service() {
 
         if (!skipLocationClientForTesting) {
             requestLocationUpdates()
-            runCatching { repository?.startRealtimeOrdersListener() }
+            runCatching {
+                repository?.startRealtimeOrdersListener(
+                    CaptainRepository.ORDERS_LISTENER_CONSUMER_LOCATION_SERVICE
+                )
+            }
         }
     }
 
@@ -322,7 +320,15 @@ class CaptainLocationService : Service() {
         }
 
         CaptainLocationTracker.setTracking(false)
-        runCatching { repository?.stopRealtimeOrdersListener() }
+        runCatching {
+            if (markOfflineInFirestore) {
+                repository?.stopRealtimeOrdersListener()
+            } else {
+                repository?.releaseOrdersListener(
+                    CaptainRepository.ORDERS_LISTENER_CONSUMER_LOCATION_SERVICE
+                )
+            }
+        }
         if (isInForeground) {
             runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
             isInForeground = false
@@ -389,7 +395,11 @@ class CaptainLocationService : Service() {
             fusedLocationClient.removeLocationUpdates(locationCallback)
         } catch (_: Exception) {}
         serviceScope.cancel()
-        runCatching { repository?.stopRealtimeOrdersListener() }
+        runCatching {
+            repository?.releaseOrdersListener(
+                CaptainRepository.ORDERS_LISTENER_CONSUMER_LOCATION_SERVICE
+            )
+        }
         isInForeground = false
         CaptainLocationTracker.setTracking(false)
     }
