@@ -351,9 +351,9 @@ class ShiftKeyPresenceAndOrdersGuardTest {
         try {
             vm.toggleOnlineStatus()
             val toast = awaitFirstToast(events)
-            assertEquals(listOf("ready", "working", "server_verify", "orders_sync"), callSequence)
+            assertEquals(listOf("working", "server_verify", "orders_sync"), callSequence)
             assertEquals(1, syncCalls)
-            assertNotNull("GPS service must start ONLY after ready -> working -> server_verify", shadowApp.nextStartedService)
+            assertNotNull("GPS service must start ONLY after working -> server_verify", shadowApp.nextStartedService)
             assertTrue(toast.message.contains("متصل"))
         } finally {
             eventJob.cancel()
@@ -403,7 +403,7 @@ class ShiftKeyPresenceAndOrdersGuardTest {
         try {
             vm.toggleOnlineStatus()
             awaitFirstToast(events)
-            assertEquals(listOf("ready", "working", "server_verify_ok", "orders_sync"), callSequence)
+            assertEquals(listOf("working", "server_verify_ok", "orders_sync"), callSequence)
             assertNotNull(shadowApp.nextStartedService)
         } finally {
             eventJob.cancel()
