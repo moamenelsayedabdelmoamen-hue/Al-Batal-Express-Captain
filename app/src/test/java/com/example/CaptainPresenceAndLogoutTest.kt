@@ -539,7 +539,7 @@ class CaptainPresenceAndLogoutTest {
     }
 
     @Test
-    fun startWorkButton_whenReadinessServerCallThrows_neverCrashesAndShowsArabicErrorToast() = runBlocking {
+    fun startWorkButton_whenWorkingServerCallThrows_neverCrashesAndShowsArabicErrorToast() = runBlocking {
         Shadows.shadowOf(appContext).grantPermissions(
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_COARSE_LOCATION
@@ -550,9 +550,9 @@ class CaptainPresenceAndLogoutTest {
         val vm = CaptainViewModel(appContext)
         Shadows.shadowOf(Looper.getMainLooper()).idle()
         val uid = "cap_start_work_crash_guard"
-        var readyCalls = 0
-        vm.setCaptainReadyStatusOverride = {
-            readyCalls++
+        var workingCalls = 0
+        vm.tickerSetOnlineStatusOverride = {
+            workingCalls++
             throw IOException("Simulated Cloud Function failure on Start Work")
         }
         vm.repository.setAccountApprovalSnapshot(
@@ -583,11 +583,11 @@ class CaptainPresenceAndLogoutTest {
             vm.eventFlow.collect { collectedEvents.add(it) }
         }
         try {
-            // Triggers Start Work ("ابدأ العمل"); readiness call throws IOException which previously crashed the app.
+            // Triggers Connect; the single working transition throws IOException and must be handled safely.
             vm.toggleOnlineStatus()
 
             val toast = awaitFirstToastWhileIdlingMainLooper(collectedEvents)
-            assertEquals("Expected readiness callable to be attempted once", 1, readyCalls)
+            assertEquals("Expected working callable to be attempted once", 1, workingCalls)
             assertTrue(
                 "Expected Start Work Arabic error toast, got: ${toast.message}",
                 toast.message.contains("تعذر بدء العمل")
@@ -597,7 +597,7 @@ class CaptainPresenceAndLogoutTest {
             collectedEvents.clear()
             vm.toggleOnlineStatus()
             val retryToast = awaitFirstToastWhileIdlingMainLooper(collectedEvents)
-            assertEquals("Expected second Start Work tap to retry cleanly", 2, readyCalls)
+            assertEquals("Expected second Connect tap to retry cleanly", 2, workingCalls)
             assertTrue(
                 "Expected Start Work Arabic error toast on retry, got: ${retryToast.message}",
                 retryToast.message.contains("تعذر بدء العمل")
@@ -609,7 +609,7 @@ class CaptainPresenceAndLogoutTest {
     }
 
     @Test
-    fun onLocationPermissionGranted_whenReadinessServerCallThrows_neverCrashesAndShowsArabicErrorToast() = runBlocking {
+    fun onLocationPermissionGranted_whenWorkingServerCallThrows_neverCrashesAndShowsArabicErrorToast() = runBlocking {
         Shadows.shadowOf(appContext).grantPermissions(
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_COARSE_LOCATION
@@ -620,8 +620,8 @@ class CaptainPresenceAndLogoutTest {
         val vm = CaptainViewModel(appContext)
         Shadows.shadowOf(Looper.getMainLooper()).idle()
         val uid = "cap_perm_grant_crash_guard"
-        vm.setCaptainReadyStatusOverride = {
-            throw IllegalStateException("Simulated FirebaseFunctions failure after location permission grant")
+        vm.tickerSetOnlineStatusOverride = {
+            throw IllegalStateException("Simulated working transition failure after location permission grant")
         }
         vm.repository.setAccountApprovalSnapshot(
             CaptainApprovalSnapshot(status = CaptainAccountStatus.APPROVED, isApproved = true)
@@ -757,7 +757,7 @@ class CaptainPresenceAndLogoutTest {
             vm.onAppForegrounded()
 
             val activeToast = awaitFirstToastWhileIdlingMainLooper(collectedEvents)
-            assertEquals("Expected readiness confirmation", 1, readyCalls)
+            assertEquals("Active-shift Connect should confirm readiness in the same server transition", 0, readyCalls)
             assertEquals("Expected online working activation", 1, onlineCalls)
             assertEquals("Expected orders sync upon going online", 1, syncOrdersCalls)
             val startedService = shadowApp.nextStartedService

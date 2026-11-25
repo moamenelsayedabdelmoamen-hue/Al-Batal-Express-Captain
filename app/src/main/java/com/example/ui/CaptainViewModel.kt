@@ -1203,15 +1203,13 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
 
     private suspend fun activateShiftWorkSafely(
         app: Application,
-        callReadyFirst: Boolean,
         successToast: String,
         ineligibleToast: String
     ) {
         val wasOfflineBeforeActivation = (repository.getCaptain()?.isOnline ?: (captainState.value?.isOnline == true)) != true
         try {
-            if (callReadyFirst) {
-                setCaptainReadyStatusOverride?.invoke(true) ?: repository.setCaptainReadyStatus(true)
-            }
+            // The server's "working" transition now confirms the active shift and
+            // promotes the captain in one authoritative write.
             tickerSetOnlineStatusOverride?.invoke(true) ?: repository.setOnlineStatus(true)
             when (val eligibility = tickerLocationEligibilityOverride?.invoke() ?: repository.checkLocationTrackingEligibility()) {
                 is LocationEligibilityResult.Eligible -> {
@@ -1314,24 +1312,11 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                             Log.w("CaptainViewModel", "Error checking working status while toggling online status: ${e.message}")
                             false
                         }
-                        val alreadyServerReady = if (alreadyServerWorking) {
-                            true
-                        } else {
-                            try {
-                                tickerShiftReadinessOverride?.invoke() ?: repository.hasConfirmedShiftReadiness()
-                            } catch (cancelled: CancellationException) {
-                                throw cancelled
-                            } catch (e: Exception) {
-                                Log.w("CaptainViewModel", "Error checking readiness while toggling online status: ${e.message}")
-                                false
-                            }
-                        }
                         if (!alreadyServerWorking || !CaptainLocationTracker.isTracking.value) {
                             activateShiftWorkSafely(
                                 app = app,
-                                callReadyFirst = !alreadyServerReady,
                                 successToast = "أنت الآن متصل وتم فتح الموقع (GPS) لاستقبال الطلبات.",
-                                ineligibleToast = "تعذر تفعيل العمل وGPS حالياً. تأكد من تأكيد الجاهزية وحاول مرة أخرى."
+                                ineligibleToast = "تعذر تفعيل العمل وGPS حالياً. تأكد من اعتماد حسابك ووجود شفت نشط وحاول مرة أخرى."
                             )
                             return@launch
                         }
@@ -1406,7 +1391,6 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                         pendingStartWorkAfterGpsEnable = false
                         activateShiftWorkSafely(
                             app = app,
-                            callReadyFirst = true,
                             successToast = "أنت الآن متصل وتم فتح الموقع (GPS) لاستقبال الطلبات.",
                             ineligibleToast = "تعذر بدء العمل حالياً. تأكد من اعتماد حسابك ووجود شفت نشط ثم أعد المحاولة."
                         )
@@ -1451,18 +1435,10 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                     _eventFlow.emit(UiEvent.ShowToast("تم منح إذن الموقع. لن يبدأ التتبع قبل بداية الشفت وتأكيد الجاهزية."))
                     return@launch
                 }
-                val alreadyServerReady = try {
-                    tickerShiftReadinessOverride?.invoke() ?: repository.hasConfirmedShiftReadiness()
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    false
-                }
                 activateShiftWorkSafely(
                     app = app,
-                    callReadyFirst = !alreadyServerReady,
                     successToast = "أنت الآن متصل وتم فتح الموقع (GPS) لاستقبال الطلبات.",
-                    ineligibleToast = "لا يمكن تشغيل GPS قبل تأكيد الجاهزية وداخل الشفت."
+                    ineligibleToast = "لا يمكن تشغيل GPS إلا أثناء الشفت النشط."
                 )
             } finally {
                 isUpdatingOnlineStatus = false
@@ -1740,16 +1716,8 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                 viewModelScope.launch {
                     isUpdatingOnlineStatus = true
                     try {
-                        val alreadyServerReady = try {
-                            tickerShiftReadinessOverride?.invoke() ?: repository.hasConfirmedShiftReadiness()
-                        } catch (cancelled: CancellationException) {
-                            throw cancelled
-                        } catch (_: Exception) {
-                            false
-                        }
                         activateShiftWorkSafely(
                             app = app,
-                            callReadyFirst = !alreadyServerReady,
                             successToast = "أنت الآن متصل وتم فتح الموقع (GPS) لاستقبال الطلبات.",
                             ineligibleToast = "تعذر بدء العمل حالياً. تأكد من اعتماد حسابك ووجود شفت نشط ثم أعد المحاولة."
                         )
