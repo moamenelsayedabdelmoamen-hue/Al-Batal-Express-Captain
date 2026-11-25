@@ -281,7 +281,8 @@ object ShiftManager {
         if (nextToday != null) {
             val minUntilStart = parseTimeToMinutes(nextToday.startTime) - currentMinutes
             val millisUntilStart = (minUntilStart * 60L - currentSeconds) * 1000L
-            return if (minUntilStart <= 180) {
+            // The ready/connect action is exposed only during the final 30 minutes before shift start.
+            return if (minUntilStart <= 30) {
                 ShiftStatus.UpcomingSoon(
                     shift = nextToday,
                     millisUntilStart = millisUntilStart.coerceAtLeast(1000L),
