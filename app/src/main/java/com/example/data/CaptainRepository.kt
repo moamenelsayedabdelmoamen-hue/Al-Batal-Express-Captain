@@ -253,8 +253,6 @@ class CaptainRepository(
     private var lastOperationalHistorySyncUid: String? = null
     @Volatile
     private var lastOperationalHistorySyncAtMs: Long = 0L
-    @Volatile
-    private var dateBoundedHistoryIndexUnavailable: Boolean = false
     private val syncedDateKeysCache = ConcurrentHashMap<String, Long>()
 
     @Volatile
@@ -1574,61 +1572,30 @@ class CaptainRepository(
         myPhone: String,
         windowStartMs: Long,
         windowEndMs: Long
-    ): Result<Int>? {
-        if (dateBoundedHistoryIndexUnavailable) return null
-
+    ): Result<Int> {
         val startTs = Timestamp(Date(windowStartMs))
         val endTs = Timestamp(Date(windowEndMs))
-        val matchedDocs = linkedMapOf<String, DocumentSnapshot>()
-        var succeededQueries = 0
-        var missingIndexDetected = false
-        var lastError: Exception? = null
-
-        val results = coroutineScope {
-            ORDER_ASSIGNMENT_QUERY_FIELDS.map { field ->
-                async(Dispatchers.IO) {
-                    try {
-                        val snap = firestore.collection("orders")
-                            .whereEqualTo(field, myUid)
-                            .whereGreaterThanOrEqualTo("createdAt", startTs)
-                            .whereLessThanOrEqualTo("createdAt", endTs)
-                            .get()
-                            .await()
-                        Result.success(snap.documents)
-                    } catch (e: Exception) {
-                        Result.failure(e)
-                    }
-                }
-            }.awaitAll()
-        }
-
-        for (res in results) {
-            if (res.isSuccess) {
-                succeededQueries++
-                for (doc in res.getOrDefault(emptyList())) {
-                    matchedDocs[doc.id] = doc
-                }
+        return try {
+            // One Firestore OR query replaces four parallel queries; duplicate matches are returned once.
+            val ownershipFilter = Filter.or(
+                *ORDER_ASSIGNMENT_QUERY_FIELDS.map { Filter.equalTo(it, myUid) }.toTypedArray()
+            )
+            val snapshot = firestore.collection("orders")
+                .where(ownershipFilter)
+                .whereGreaterThanOrEqualTo("createdAt", startTs)
+                .whereLessThanOrEqualTo("createdAt", endTs)
+                .get()
+                .await()
+            Result.success(persistOwnedHistoryDocuments(snapshot.documents, myUid, myPhone))
+        } catch (e: Exception) {
+            val fsEx = e as? FirebaseFirestoreException
+            if (fsEx?.code == FirebaseFirestoreException.Code.FAILED_PRECONDITION) {
+                Log.e("CaptainRepository", "[HistorySync] Missing composite index; skipping remote sync instead of reading the entire archive.", e)
             } else {
-                val err = res.exceptionOrNull() as? Exception
-                val fsEx = err as? FirebaseFirestoreException
-                if (fsEx?.code == FirebaseFirestoreException.Code.FAILED_PRECONDITION) {
-                    missingIndexDetected = true
-                }
-                if (err != null) lastError = err
+                Log.w("CaptainRepository", "[HistorySync] Bounded order history query failed", e)
             }
+            Result.failure(e)
         }
-
-        if (missingIndexDetected) {
-            dateBoundedHistoryIndexUnavailable = true
-            Log.i("CaptainRepository", "[HistorySync] Composite index unavailable for createdAt range query; falling back to TTL-cached history sync")
-            return null
-        }
-        if (succeededQueries == 0 && lastError != null) {
-            return Result.failure(lastError)
-        }
-
-        val savedCount = persistOwnedHistoryDocuments(matchedDocs.values, myUid, myPhone)
-        return Result.success(savedCount)
     }
 
     /**
@@ -1666,28 +1633,14 @@ class CaptainRepository(
                 windowEndMs = windowEndMs
             )
 
-            if (boundedResult != null) {
-                syncDailyWalletsSubcollection(myUid)
-                reconcileDailyWallets(nowMs)
-                if (boundedResult.isSuccess) {
-                    lastOperationalHistorySyncUid = myUid
-                    lastOperationalHistorySyncAtMs = nowMs
-                    syncedDateKeysCache["$myUid:$currentDayKey"] = nowMs
-                }
-                return@withLock boundedResult
-            }
-
-            // Fallback when Firestore composite index isn't deployed: run TTL-cached parallel sync once
-            val fallbackResult = syncCaptainOrdersHistoryInternal(
-                myUid = myUid,
-                myPhone = myPhone,
-                forceRefresh = forceRefresh
-            )
-            if (fallbackResult.isSuccess) {
+            syncDailyWalletsSubcollection(myUid)
+            reconcileDailyWallets(nowMs)
+            if (boundedResult.isSuccess) {
                 lastOperationalHistorySyncUid = myUid
                 lastOperationalHistorySyncAtMs = nowMs
+                syncedDateKeysCache["$myUid:$currentDayKey"] = nowMs
             }
-            fallbackResult
+            boundedResult
         }
     }
 
@@ -1726,50 +1679,17 @@ class CaptainRepository(
         }
 
         return try {
-            val matchedDocs = linkedMapOf<String, DocumentSnapshot>()
-            var succeededQueries = 0
-            var lastQueryError: Exception? = null
-
-            val results = coroutineScope {
-                val orderJobs = ORDER_ASSIGNMENT_QUERY_FIELDS.map { field ->
-                    async(Dispatchers.IO) {
-                        try {
-                            val snap = firestore.collection("orders")
-                                .whereEqualTo(field, myUid)
-                                .get()
-                                .await()
-                            Result.success(snap.documents)
-                        } catch (e: Exception) {
-                            Log.w("CaptainRepository", "[HistorySync] Query orders.$field == uid notice: ${e.message}")
-                            Result.failure(e)
-                        }
-                    }
+            val ownershipFilter = Filter.or(
+                *ORDER_ASSIGNMENT_QUERY_FIELDS.map { Filter.equalTo(it, myUid) }.toTypedArray()
+            )
+            val (snapshot, _) = coroutineScope {
+                val ordersJob = async(Dispatchers.IO) {
+                    firestore.collection("orders").where(ownershipFilter).get().await()
                 }
-                val walletJob = async(Dispatchers.IO) {
-                    syncDailyWalletsSubcollection(myUid)
-                }
-                val orderResults = orderJobs.awaitAll()
-                walletJob.await()
-                orderResults
+                val walletJob = async(Dispatchers.IO) { syncDailyWalletsSubcollection(myUid) }
+                ordersJob.await() to walletJob.await()
             }
-
-            for (res in results) {
-                if (res.isSuccess) {
-                    succeededQueries++
-                    for (doc in res.getOrDefault(emptyList())) {
-                        matchedDocs[doc.id] = doc
-                    }
-                } else {
-                    (res.exceptionOrNull() as? Exception)?.let { lastQueryError = it }
-                }
-            }
-
-            if (succeededQueries == 0 && lastQueryError != null) {
-                reconcileDailyWallets()
-                return Result.failure(lastQueryError)
-            }
-
-            val savedCount = persistOwnedHistoryDocuments(matchedDocs.values, myUid, myPhone)
+            val savedCount = persistOwnedHistoryDocuments(snapshot.documents, myUid, myPhone)
             reconcileDailyWallets()
             lastFullHistorySyncUid = myUid
             lastFullHistorySyncAtMs = System.currentTimeMillis()
@@ -1833,23 +1753,11 @@ class CaptainRepository(
                             windowStartMs = dayStartMs - OVERNIGHT_QUERY_BUFFER_MS,
                             windowEndMs = dayEndMs + OVERNIGHT_QUERY_BUFFER_MS
                         )
-                        if (bounded != null) {
-                            if (bounded.isSuccess) {
-                                syncedDateKeysCache[cacheKey] = System.currentTimeMillis()
-                                reconcileDailyWallets()
-                            }
-                            bounded
-                        } else {
-                            syncCaptainOrdersHistoryInternal(
-                                myUid = myUid,
-                                myPhone = myPhone,
-                                forceRefresh = forceRefresh
-                            ).also { res ->
-                                if (res.isSuccess) {
-                                    syncedDateKeysCache[cacheKey] = System.currentTimeMillis()
-                                }
-                            }
+                        if (bounded.isSuccess) {
+                            syncedDateKeysCache[cacheKey] = System.currentTimeMillis()
+                            reconcileDailyWallets()
                         }
+                        bounded
                     }
                 }
             }
