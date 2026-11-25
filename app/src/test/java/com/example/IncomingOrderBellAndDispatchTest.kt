@@ -453,7 +453,7 @@ class IncomingOrderBellAndDispatchTest {
             legacyDb.close()
 
             val migratedDb = Room.databaseBuilder(appContext, AppDatabase::class.java, "migration_test_v11_v12.db")
-                .addMigrations(AppDatabase.MIGRATION_11_12)
+                .addMigrations(*AppDatabase.ALL_MIGRATIONS)
                 .allowMainThreadQueries()
                 .build()
             val preservedOrder = kotlinx.coroutines.runBlocking {

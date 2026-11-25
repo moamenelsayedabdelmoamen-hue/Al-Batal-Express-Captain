@@ -242,7 +242,7 @@ class ShiftActivationPr14RegressionTest {
             vm.toggleOnlineStatus()
             val toast = awaitFirstToast(events)
 
-            assertEquals(listOf("ready", "working"), actions)
+            assertEquals(listOf("working"), actions)
             assertTrue("Captain must be online locally", vm.repository.captainDao.getCaptain()?.isOnline == true)
             assertEquals("Orders sync must start after server confirmation", 1, syncOrdersCalls)
             val started = shadowApp.nextStartedService
@@ -477,7 +477,7 @@ class ShiftActivationPr14RegressionTest {
         Shadows.shadowOf(Looper.getMainLooper()).idle()
         val uid = "cap_net_drop"
         var syncOrdersCalls = 0
-        vm.setCaptainReadyStatusOverride = { throw IOException("Network unreachable") }
+        vm.tickerSetOnlineStatusOverride = { throw IOException("Network unreachable") }
         vm.tickerSyncOrdersOverride = { syncOrdersCalls++ }
         vm.repository.setAccountApprovalSnapshot(CaptainApprovalSnapshot(status = CaptainAccountStatus.APPROVED, isApproved = true))
         vm.repository.captainDao.insertOrUpdate(
@@ -551,7 +551,7 @@ class ShiftActivationPr14RegressionTest {
 
     // 8. نجاح ready وفشل working
     @Test
-    fun scenario08_readySucceedsButWorkingFails_rollsBackLocalOnlineAndNeverStartsGpsOrOrders() = runBlocking {
+    fun scenario08_workingFails_rollsBackLocalOnlineAndNeverStartsGpsOrOrders() = runBlocking {
         grantLocationAndEnableGps(true)
         val shadowApp = Shadows.shadowOf(appContext)
         shadowApp.clearStartedServices()
@@ -559,15 +559,9 @@ class ShiftActivationPr14RegressionTest {
         val vm = CaptainViewModel(appContext)
         Shadows.shadowOf(Looper.getMainLooper()).idle()
         val uid = "cap_ready_ok_working_fail"
-        var readyCalls = 0
         var workingCalls = 0
         var syncOrdersCalls = 0
 
-        vm.setCaptainReadyStatusOverride = { ready ->
-            readyCalls++
-            // Ready succeeds and marks Room online
-            vm.repository.captainDao.updateOnlineStatus(ready)
-        }
         vm.tickerSetOnlineStatusOverride = { online ->
             if (online) {
                 workingCalls++
@@ -588,8 +582,7 @@ class ShiftActivationPr14RegressionTest {
             vm.toggleOnlineStatus()
             val toast = awaitFirstToast(events)
 
-            assertEquals("Ready should have been called once", 1, readyCalls)
-            assertEquals("Working should have been called once", 1, workingCalls)
+            assertEquals("Working should be the only presence call during an active shift", 1, workingCalls)
             assertFalse("Local online flag must roll back to offline after working fails", vm.repository.captainDao.getCaptain()?.isOnline == true)
             assertNull("GPS must NOT start when working fails", shadowApp.nextStartedService)
             assertEquals("Orders must NOT sync when working fails", 0, syncOrdersCalls)
