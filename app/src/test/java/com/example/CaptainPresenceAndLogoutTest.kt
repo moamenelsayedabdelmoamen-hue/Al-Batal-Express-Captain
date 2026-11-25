@@ -876,4 +876,73 @@ class CaptainPresenceAndLogoutTest {
             backend.docs["cap_fcm_fallback"]?.get("fcmToken")
         )
     }
+
+
+    @Test
+    fun onlineButton_retriesOnceWhenServerReadStillShowsPreWorkingState() = runBlocking {
+        Shadows.shadowOf(appContext).grantPermissions(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        )
+        val locationManager = appContext.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        Shadows.shadowOf(locationManager).setProviderEnabled(LocationManager.GPS_PROVIDER, true)
+        Shadows.shadowOf(locationManager).setProviderEnabled(LocationManager.NETWORK_PROVIDER, true)
+        CaptainLocationTracker.isAppInForegroundOverrideForTesting = { true }
+
+        val vm = CaptainViewModel(appContext)
+        Shadows.shadowOf(Looper.getMainLooper()).idle()
+        val uid = "cap_online_activation_retry"
+        var onlineCalls = 0
+        var eligibilityCalls = 0
+        vm.setCaptainReadyStatusOverride = { }
+        vm.tickerSetOnlineStatusOverride = { if (it) onlineCalls++ }
+        vm.tickerLocationEligibilityOverride = {
+            eligibilityCalls++
+            if (eligibilityCalls == 1) {
+                LocationEligibilityResult.Ineligible("server_not_working_for_active_shift")
+            } else {
+                LocationEligibilityResult.Eligible
+            }
+        }
+        vm.repository.setAccountApprovalSnapshot(
+            CaptainApprovalSnapshot(status = CaptainAccountStatus.APPROVED, isApproved = true)
+        )
+        vm.repository.captainDao.insertOrUpdate(
+            CaptainEntity(
+                id = 1,
+                uid = uid,
+                fullName = "كابتن اختبار إعادة التحقق",
+                phoneNumber = "01099990001",
+                isOnline = false,
+                isLoggedIn = true
+            )
+        )
+        vm.navigateTo(ScreenRoute.Main.route)
+        vm.applyCanonicalShiftSnapshot(
+            uid = uid,
+            exists = true,
+            docData = buildAllDayCanonicalScheduleDoc()
+        )
+        assertTrue("Expected active shift", vm.shiftStatus.value is ShiftStatus.Active)
+
+        val collectedEvents = CopyOnWriteArrayList<UiEvent>()
+        val shiftsJob = CoroutineScope(Dispatchers.Unconfined).launch { vm.shifts.collect { } }
+        val collectorJob = CoroutineScope(Dispatchers.Unconfined).launch { vm.eventFlow.collect { collectedEvents.add(it) } }
+        try {
+            vm.toggleOnlineStatus()
+            val toast = awaitFirstToastWhileIdlingMainLooper(collectedEvents)
+            assertEquals("Expected one retry of the working transition", 2, onlineCalls)
+            assertEquals("Expected eligibility to be checked again after retry", 2, eligibilityCalls)
+            assertTrue(
+                "Expected connected confirmation after successful retry, got: ${toast.message}",
+                toast.message.contains("متصل") && toast.message.contains("GPS")
+            )
+            assertNotNull("Expected location service to start after successful verification", Shadows.shadowOf(appContext).nextStartedService)
+        } finally {
+            CaptainLocationTracker.isAppInForegroundOverrideForTesting = null
+            collectorJob.cancel()
+            shiftsJob.cancel()
+        }
+    }
+
 }
