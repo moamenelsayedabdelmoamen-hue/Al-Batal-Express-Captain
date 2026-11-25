@@ -1314,22 +1314,10 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                             Log.w("CaptainViewModel", "Error checking working status while toggling online status: ${e.message}")
                             false
                         }
-                        val alreadyServerReady = if (alreadyServerWorking) {
-                            true
-                        } else {
-                            try {
-                                tickerShiftReadinessOverride?.invoke() ?: repository.hasConfirmedShiftReadiness()
-                            } catch (cancelled: CancellationException) {
-                                throw cancelled
-                            } catch (e: Exception) {
-                                Log.w("CaptainViewModel", "Error checking readiness while toggling online status: ${e.message}")
-                                false
-                            }
-                        }
                         if (!alreadyServerWorking || !CaptainLocationTracker.isTracking.value) {
                             activateShiftWorkSafely(
                                 app = app,
-                                callReadyFirst = !alreadyServerReady,
+                                callReadyFirst = false,
                                 successToast = "أنت الآن متصل وتم فتح الموقع (GPS) لاستقبال الطلبات.",
                                 ineligibleToast = "تعذر تفعيل العمل وGPS حالياً. تأكد من تأكيد الجاهزية وحاول مرة أخرى."
                             )
@@ -1406,7 +1394,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                         pendingStartWorkAfterGpsEnable = false
                         activateShiftWorkSafely(
                             app = app,
-                            callReadyFirst = true,
+                            callReadyFirst = false,
                             successToast = "أنت الآن متصل وتم فتح الموقع (GPS) لاستقبال الطلبات.",
                             ineligibleToast = "تعذر بدء العمل حالياً. تأكد من اعتماد حسابك ووجود شفت نشط ثم أعد المحاولة."
                         )
@@ -1451,16 +1439,9 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                     _eventFlow.emit(UiEvent.ShowToast("تم منح إذن الموقع. لن يبدأ التتبع قبل بداية الشفت وتأكيد الجاهزية."))
                     return@launch
                 }
-                val alreadyServerReady = try {
-                    tickerShiftReadinessOverride?.invoke() ?: repository.hasConfirmedShiftReadiness()
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    false
-                }
                 activateShiftWorkSafely(
                     app = app,
-                    callReadyFirst = !alreadyServerReady,
+                    callReadyFirst = false,
                     successToast = "أنت الآن متصل وتم فتح الموقع (GPS) لاستقبال الطلبات.",
                     ineligibleToast = "لا يمكن تشغيل GPS قبل تأكيد الجاهزية وداخل الشفت."
                 )
@@ -1740,16 +1721,9 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                 viewModelScope.launch {
                     isUpdatingOnlineStatus = true
                     try {
-                        val alreadyServerReady = try {
-                            tickerShiftReadinessOverride?.invoke() ?: repository.hasConfirmedShiftReadiness()
-                        } catch (cancelled: CancellationException) {
-                            throw cancelled
-                        } catch (_: Exception) {
-                            false
-                        }
                         activateShiftWorkSafely(
                             app = app,
-                            callReadyFirst = !alreadyServerReady,
+                            callReadyFirst = false,
                             successToast = "أنت الآن متصل وتم فتح الموقع (GPS) لاستقبال الطلبات.",
                             ineligibleToast = "تعذر بدء العمل حالياً. تأكد من اعتماد حسابك ووجود شفت نشط ثم أعد المحاولة."
                         )
