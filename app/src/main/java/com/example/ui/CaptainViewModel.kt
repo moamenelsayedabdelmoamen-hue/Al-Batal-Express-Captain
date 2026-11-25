@@ -1316,7 +1316,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                             activateShiftWorkSafely(
                                 app = app,
                                 successToast = "أنت الآن متصل وتم فتح الموقع (GPS) لاستقبال الطلبات.",
-                                ineligibleToast = "تعذر تفعيل العمل وGPS حالياً. تأكد من تأكيد الجاهزية وحاول مرة أخرى."
+                                ineligibleToast = "تعذر تفعيل العمل وGPS حالياً. تأكد من اعتماد حسابك ووجود شفت نشط وحاول مرة أخرى."
                             )
                             return@launch
                         }
@@ -1438,7 +1438,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                 activateShiftWorkSafely(
                     app = app,
                     successToast = "أنت الآن متصل وتم فتح الموقع (GPS) لاستقبال الطلبات.",
-                    ineligibleToast = "لا يمكن تشغيل GPS قبل تأكيد الجاهزية وداخل الشفت."
+                    ineligibleToast = "لا يمكن تشغيل GPS إلا أثناء الشفت النشط."
                 )
             } finally {
                 isUpdatingOnlineStatus = false
