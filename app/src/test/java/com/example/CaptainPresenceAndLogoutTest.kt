@@ -757,7 +757,7 @@ class CaptainPresenceAndLogoutTest {
             vm.onAppForegrounded()
 
             val activeToast = awaitFirstToastWhileIdlingMainLooper(collectedEvents)
-            assertEquals("Expected readiness confirmation", 1, readyCalls)
+            assertEquals("Active-shift Connect should confirm readiness in the same server transition", 0, readyCalls)
             assertEquals("Expected online working activation", 1, onlineCalls)
             assertEquals("Expected orders sync upon going online", 1, syncOrdersCalls)
             val startedService = shadowApp.nextStartedService
