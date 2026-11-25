@@ -1203,15 +1203,13 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
 
     private suspend fun activateShiftWorkSafely(
         app: Application,
-        callReadyFirst: Boolean,
         successToast: String,
         ineligibleToast: String
     ) {
         val wasOfflineBeforeActivation = (repository.getCaptain()?.isOnline ?: (captainState.value?.isOnline == true)) != true
         try {
-            if (callReadyFirst) {
-                setCaptainReadyStatusOverride?.invoke(true) ?: repository.setCaptainReadyStatus(true)
-            }
+            // The server's "working" transition now confirms the active shift and
+            // promotes the captain in one authoritative write.
             tickerSetOnlineStatusOverride?.invoke(true) ?: repository.setOnlineStatus(true)
             when (val eligibility = tickerLocationEligibilityOverride?.invoke() ?: repository.checkLocationTrackingEligibility()) {
                 is LocationEligibilityResult.Eligible -> {
@@ -1317,7 +1315,6 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                         if (!alreadyServerWorking || !CaptainLocationTracker.isTracking.value) {
                             activateShiftWorkSafely(
                                 app = app,
-                                callReadyFirst = false,
                                 successToast = "أنت الآن متصل وتم فتح الموقع (GPS) لاستقبال الطلبات.",
                                 ineligibleToast = "تعذر تفعيل العمل وGPS حالياً. تأكد من تأكيد الجاهزية وحاول مرة أخرى."
                             )
@@ -1394,7 +1391,6 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                         pendingStartWorkAfterGpsEnable = false
                         activateShiftWorkSafely(
                             app = app,
-                            callReadyFirst = false,
                             successToast = "أنت الآن متصل وتم فتح الموقع (GPS) لاستقبال الطلبات.",
                             ineligibleToast = "تعذر بدء العمل حالياً. تأكد من اعتماد حسابك ووجود شفت نشط ثم أعد المحاولة."
                         )
@@ -1441,7 +1437,6 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                 }
                 activateShiftWorkSafely(
                     app = app,
-                    callReadyFirst = false,
                     successToast = "أنت الآن متصل وتم فتح الموقع (GPS) لاستقبال الطلبات.",
                     ineligibleToast = "لا يمكن تشغيل GPS قبل تأكيد الجاهزية وداخل الشفت."
                 )
@@ -1723,7 +1718,6 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                     try {
                         activateShiftWorkSafely(
                             app = app,
-                            callReadyFirst = false,
                             successToast = "أنت الآن متصل وتم فتح الموقع (GPS) لاستقبال الطلبات.",
                             ineligibleToast = "تعذر بدء العمل حالياً. تأكد من اعتماد حسابك ووجود شفت نشط ثم أعد المحاولة."
                         )
