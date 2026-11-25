@@ -21,6 +21,7 @@ import com.google.firebase.auth.UserProfileChangeRequest
 import com.google.firebase.firestore.DocumentChange
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FieldValue
+import com.google.firebase.firestore.Filter
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.functions.FirebaseFunctions
 import com.google.firebase.functions.FirebaseFunctionsException
