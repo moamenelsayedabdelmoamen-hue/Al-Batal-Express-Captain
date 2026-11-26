@@ -3430,11 +3430,11 @@ class CaptainRepository(
         val dateKey = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
             timeZone = ShiftManager.CAIRO_TIME_ZONE
         }.format(calendar.time)
-        val startMinutes = ShiftManager.parseTimeToMinutes(shift.startTime)
-        val startHour = (startMinutes / 60).coerceIn(0, 23)
-        val startMinute = (startMinutes % 60).coerceIn(0, 59)
-        val hhmm = String.format(Locale.US, "%02d%02d", startHour, startMinute)
-        return "$dateKey|$dayKey|$hhmm"
+        // Must match the backend key (functions/src/shifts.ts keyFor): minutes since Cairo
+        // midnight, zero-padded to 4 digits (18:36 -> "1116"), not HHmm.
+        val startMinutes = ShiftManager.parseTimeToMinutes(shift.startTime).coerceIn(0, 24 * 60 - 1)
+        val startKey = String.format(Locale.US, "%04d", startMinutes)
+        return "$dateKey|$dayKey|$startKey"
     }
 
     /**
