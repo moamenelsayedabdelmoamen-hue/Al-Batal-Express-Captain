@@ -1211,7 +1211,25 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
             // The server's "working" transition now confirms the active shift and
             // promotes the captain in one authoritative write.
             tickerSetOnlineStatusOverride?.invoke(true) ?: repository.setOnlineStatus(true)
-            when (val eligibility = tickerLocationEligibilityOverride?.invoke() ?: repository.checkLocationTrackingEligibility()) {
+            // The callable transition and the following server read are separate network
+            // operations. Retry one time if the first read still sees the pre-transition
+            // captain document; never treat a confirmed rejection as success.
+            var eligibility = tickerLocationEligibilityOverride?.invoke()
+                ?: repository.checkLocationTrackingEligibility()
+            if (eligibility is LocationEligibilityResult.Ineligible &&
+                eligibility.reason == "server_not_working_for_active_shift"
+            ) {
+                Log.w(
+                    "CaptainViewModel",
+                    "Server presence has not reflected the working transition yet; retrying once."
+                )
+                delay(500L)
+                tickerSetOnlineStatusOverride?.invoke(true) ?: repository.setOnlineStatus(true)
+                eligibility = tickerLocationEligibilityOverride?.invoke()
+                    ?: repository.checkLocationTrackingEligibility()
+            }
+
+            when (eligibility) {
                 is LocationEligibilityResult.Eligible -> {
                     val startResult = CaptainLocationTracker.startServiceSafely(app)
                     runCatching {
@@ -1257,7 +1275,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                 is LocationEligibilityResult.Ineligible -> {
                     repository.revertLocalOnlineStatusToOffline()
                     CaptainLocationTracker.stopService(app)
-                    Log.w("CaptainViewModel", "Captain ineligible to start GPS tracking: ${eligibility.reason}")
+                    Log.w("CaptainViewModel", "Captain ineligible to start GPS tracking after activation verification: ${eligibility.reason}")
                     _eventFlow.emit(UiEvent.ShowToast(ineligibleToast))
                 }
             }
