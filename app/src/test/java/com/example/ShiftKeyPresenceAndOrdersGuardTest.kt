@@ -223,7 +223,7 @@ class ShiftKeyPresenceAndOrdersGuardTest {
 
     // 1. صيغة shiftKey الموحدة: 00:00، 08:40، 09:30، 14:00، والشفت الليلي بعد منتصف الليل
     @Test
-    fun shiftKeyFormat_matchesCanonicalHHmmForAllRequiredTimesAndOvernightShift() {
+    fun shiftKeyFormat_matchesBackendMinutesSinceMidnightForAllRequiredTimesAndOvernightShift() {
         val backend = FakeBackend()
         val repo = CaptainRepository(db.captainDao(), db.orderDao(), db.shiftDao(), appContext, authBackendOverride = backend)
 
@@ -237,9 +237,9 @@ class ShiftKeyPresenceAndOrdersGuardTest {
         val s1400 = ShiftEntity("s3", "cap", Calendar.TUESDAY, "الثلاثاء", "14:00", "22:00")
 
         assertEquals("2026-11-24|tuesday|0000", repo.buildShiftInstanceKey(s0000, tuesdayNoon))
-        assertEquals("2026-11-24|tuesday|0840", repo.buildShiftInstanceKey(s0840, tuesdayNoon))
-        assertEquals("2026-11-24|tuesday|0930", repo.buildShiftInstanceKey(s0930, tuesdayNoon))
-        assertEquals("2026-11-24|tuesday|1400", repo.buildShiftInstanceKey(s1400, tuesdayNoon))
+        assertEquals("2026-11-24|tuesday|0520", repo.buildShiftInstanceKey(s0840, tuesdayNoon))
+        assertEquals("2026-11-24|tuesday|0570", repo.buildShiftInstanceKey(s0930, tuesdayNoon))
+        assertEquals("2026-11-24|tuesday|0840", repo.buildShiftInstanceKey(s1400, tuesdayNoon))
 
         // Overnight shift: Tuesday 22:00 -> 04:00 evaluated on Wednesday 2026-11-25 at 01:30 Cairo
         val overnightTuesday = ShiftEntity("s_night", "cap", Calendar.TUESDAY, "الثلاثاء", "22:00", "04:00")
@@ -250,8 +250,8 @@ class ShiftKeyPresenceAndOrdersGuardTest {
         assertTrue("Overnight shift must remain active after midnight", calcStatus is ShiftStatus.Active)
         val activeShift = (calcStatus as ShiftStatus.Active).shift
         assertEquals(
-            "Overnight shift key after midnight must preserve yesterday's start date, dayKey, and HHmm",
-            "2026-11-24|tuesday|2200",
+            "Overnight shift key after midnight must preserve yesterday's start date, dayKey, and start minutes",
+            "2026-11-24|tuesday|1320",
             repo.buildShiftInstanceKey(activeShift, wednesdayAfterMidnight)
         )
 
@@ -260,8 +260,8 @@ class ShiftKeyPresenceAndOrdersGuardTest {
             "isOnline" to true,
             "workStatus" to "working",
             "readyConfirmed" to true,
-            "readyShiftKey" to "2026-11-24|tuesday|2200",
-            "workingShiftKey" to "2026-11-24|tuesday|2200"
+            "readyShiftKey" to "2026-11-24|tuesday|1320",
+            "workingShiftKey" to "2026-11-24|tuesday|1320"
         )
         val restored = repo.reconcileServerPresenceFromDoc(
             uid = "cap",
@@ -271,7 +271,7 @@ class ShiftKeyPresenceAndOrdersGuardTest {
         )
         assertNotNull("Overnight server working session must reconcile cleanly", restored)
         assertTrue(restored!!.isConfirmedWorking)
-        assertEquals("2026-11-24|tuesday|2200", restored.workingShiftKey)
+        assertEquals("2026-11-24|tuesday|1320", restored.workingShiftKey)
     }
 
     // 2. تسجيل الدخول وتأكيد البريد لا يضبطان isOnline=true، وأول ضغطة بعد تسجيل الدخول تنفذ ready -> working -> تحقق الخادم -> GPS
@@ -437,7 +437,7 @@ class ShiftKeyPresenceAndOrdersGuardTest {
         assertTrue(statusBefore is ShiftStatus.UpcomingSoon)
         assertEquals(15L * 60_000L, (statusBefore as ShiftStatus.UpcomingSoon).millisUntilStart)
         val expectedPreShiftKey = repo.buildShiftInstanceKey(shift1400, tuesday1345)
-        assertEquals("2026-11-24|tuesday|1400", expectedPreShiftKey)
+        assertEquals("2026-11-24|tuesday|0840", expectedPreShiftKey)
 
         val readyReconciled = repo.reconcileServerPresenceFromDoc(
             uid = uid,
