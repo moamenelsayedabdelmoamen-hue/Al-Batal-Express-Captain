@@ -1154,7 +1154,7 @@ class CaptainRepository(
         }
 
         try {
-            Log.i("CaptainRepository", "[FirestoreOrdersListener] Registering 5 scoped listeners (documentChanges) on 'orders' for working captain $authUid ($confirmedShiftKey)...")
+            Log.i("CaptainRepository", "[FirestoreOrdersListener] Registering 2 scoped listeners (documentChanges) on 'orders' for working captain $authUid ($confirmedShiftKey)...")
 
             fun dispatchSnapshotChanges(
                 listenerKey: String,
@@ -1215,20 +1215,23 @@ class CaptainRepository(
                     }
                 }
 
-            // 2-5. Captain's own assigned orders across all legacy ownership fields (no duplicate offeredCaptainId listener)
-            for (field in ORDER_ASSIGNMENT_QUERY_FIELDS) {
-                newRegistrations += firestore.collection("orders")
-                    .whereEqualTo(field, authUid)
-                    .addSnapshotListener { snapshot, error ->
-                        if (error != null) {
-                            Log.w("CaptainRepository", "[FirestoreOrdersListener] $field query notice: ${error.message}")
-                            return@addSnapshotListener
-                        }
-                        if (snapshot != null) {
-                            dispatchSnapshotChanges(field, snapshot.documentChanges)
-                        }
+            // 2. One OR query covers all current and legacy assignment fields.
+            // Firestore returns each matching document once, replacing four listeners
+            // without dropping compatibility with older order ownership fields.
+            val assignmentFilter = Filter.or(
+                *ORDER_ASSIGNMENT_QUERY_FIELDS.map { Filter.equalTo(it, authUid) }.toTypedArray()
+            )
+            newRegistrations += firestore.collection("orders")
+                .where(assignmentFilter)
+                .addSnapshotListener { snapshot, error ->
+                    if (error != null) {
+                        Log.w("CaptainRepository", "[FirestoreOrdersListener] combined assignment query notice: ${error.message}")
+                        return@addSnapshotListener
                     }
-            }
+                    if (snapshot != null) {
+                        dispatchSnapshotChanges(LISTENER_KEY_ASSIGNED_ORDERS, snapshot.documentChanges)
+                    }
+                }
             synchronized(ordersListenerLock) {
                 val stillConfirmed = _serverConfirmedWorkingSession.value
                 if (stillConfirmed != null &&
@@ -4706,6 +4709,7 @@ class CaptainRepository(
         const val ORDERS_LISTENER_CONSUMER_VIEWMODEL = "viewmodel"
         const val ORDERS_LISTENER_CONSUMER_LOCATION_SERVICE = "location_service"
         internal const val LISTENER_KEY_PENDING_OFFER = "pending_offer"
+        internal const val LISTENER_KEY_ASSIGNED_ORDERS = "assigned_orders"
         internal val ORDER_ASSIGNMENT_QUERY_FIELDS = listOf(
             "captainId",
             "driverId",
