@@ -245,6 +245,8 @@ class CaptainRepository(
     private var lastShiftSyncUid: String? = null
     @Volatile
     private var lastShiftSyncAtMs: Long = 0L
+    @Volatile
+    private var cachedShiftsByUid: Pair<String, List<ShiftEntity>>? = null
 
     @Volatile
     private var lastFullHistorySyncUid: String? = null
@@ -802,6 +804,7 @@ class CaptainRepository(
     }
 
     private suspend fun saveShiftsAndScheduleAlarms(uid: String, shifts: List<ShiftEntity>) {
+        cachedShiftsByUid = uid to shifts
         shiftDao?.atomicReplaceCaptainShifts(uid, shifts)
         context?.let { ShiftNotificationScheduler.scheduleShiftNotifications(it, shifts, uid) }
     }
@@ -2037,13 +2040,12 @@ class CaptainRepository(
     suspend fun getShifts(): List<ShiftEntity> {
         val uid = resolveCurrentCaptainUid()
             ?: if (hasTestBackendOverride) null else runCatching { firebaseAuth.currentUser?.uid }.getOrNull()
-        return if (!uid.isNullOrBlank() && shiftDao != null) {
-            shiftDao.getShiftsForCaptainFlow(uid).firstOrNull()
-                ?: shiftDao.getAllShiftsFlow().firstOrNull()
-                ?: emptyList()
-        } else {
-            emptyList()
-        }
+        if (uid.isNullOrBlank()) return emptyList()
+        val fromCaptainDao = shiftDao?.getShiftsForCaptainFlow(uid)?.firstOrNull()?.takeIf { it.isNotEmpty() }
+        if (fromCaptainDao != null) return fromCaptainDao
+        val fromMemory = cachedShiftsByUid?.takeIf { it.first == uid }?.second?.takeIf { it.isNotEmpty() }
+        if (fromMemory != null) return fromMemory
+        return shiftDao?.getAllShiftsFlow()?.firstOrNull()?.takeIf { it.isNotEmpty() } ?: emptyList()
     }
 
     suspend fun getCaptain(): CaptainEntity? = captainDao.getCaptain()
@@ -3674,6 +3676,13 @@ class CaptainRepository(
             )
             LocationEligibilityResult.Eligible
         } else {
+            Log.w(
+                "CaptainRepository",
+                "Server eligibility mismatch for ${user.uid}: exists=${serverCaptain.exists()}, isOnline=$serverIsOnline, " +
+                    "workStatus=${serverCaptain.getString("workStatus")}, readyConfirmed=${serverCaptain.getBoolean("readyConfirmed")}, " +
+                    "readyShiftKey=${serverCaptain.getString("readyShiftKey")}, workingShiftKey=${serverCaptain.getString("workingShiftKey")}, " +
+                    "expectedShiftKey=$expectedShiftKey"
+            )
             _serverConfirmedWorkingSession.value = null
             stopRealtimeOrdersListener()
             LocationEligibilityResult.Ineligible("server_not_working_for_active_shift")
@@ -3953,6 +3962,33 @@ class CaptainRepository(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (e: Exception) {
+                // Backward-compatible recovery: if the deployed Cloud Function still requires an
+                // explicit "ready" confirmation before "working" during an active shift, confirm
+                // readiness first and immediately retry "working" so a single tap on "متصل" works.
+                val ffe = e as? FirebaseFunctionsException
+                if (ffe?.code == FirebaseFunctionsException.Code.FAILED_PRECONDITION) {
+                    try {
+                        Log.i(
+                            "CaptainRepository",
+                            "working returned FAILED_PRECONDITION (${ffe.message}); confirming ready then retrying working"
+                        )
+                        invokeShiftPresenceCallable("ready")
+                        invokeShiftPresenceCallable("working")
+                        pendingOfflineServerSync = false
+                        captainDao.updateOnlineStatus(true)
+                        return
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (retryError: Exception) {
+                        if (isConfirmedPresenceRejection(retryError) || !wasLocallyOnline) {
+                            _serverConfirmedWorkingSession.value = null
+                            stopRealtimeOrdersListener()
+                            captainDao.updateOnlineStatus(false)
+                        }
+                        Log.e("CaptainRepository", "Server rejected ready->working transition", retryError)
+                        throw retryError
+                    }
+                }
                 if (isConfirmedPresenceRejection(e) || !wasLocallyOnline) {
                     _serverConfirmedWorkingSession.value = null
                     stopRealtimeOrdersListener()
@@ -4263,6 +4299,7 @@ class CaptainRepository(
 
         lastSyncedFcmUid = null
         lastSyncedFcmToken = null
+        cachedShiftsByUid = null
         pendingOfflineServerSync = false
         try {
             authBackend.signOut()

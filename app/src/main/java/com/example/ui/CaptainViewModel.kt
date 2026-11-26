@@ -402,7 +402,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         .flowOn(Dispatchers.Default)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
 
-    private val _eventFlow = MutableSharedFlow<UiEvent>()
+    private val _eventFlow = MutableSharedFlow<UiEvent>(extraBufferCapacity = 16)
     val eventFlow: SharedFlow<UiEvent> = _eventFlow.asSharedFlow()
 
     private val _isLoading = MutableStateFlow(false)
@@ -1164,6 +1164,13 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
 
     @Volatile
     private var isUpdatingOnlineStatus: Boolean = false
+    private val _isUpdatingOnlineStatus = MutableStateFlow(false)
+    val isUpdatingOnlineStatusState: StateFlow<Boolean> = _isUpdatingOnlineStatus.asStateFlow()
+
+    private fun setUpdatingOnlineStatus(updating: Boolean) {
+        isUpdatingOnlineStatus = updating
+        _isUpdatingOnlineStatus.value = updating
+    }
 
     @Volatile
     private var pendingStartWorkAfterGpsEnable: Boolean = false
@@ -1282,11 +1289,25 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
 
     fun toggleOnlineStatus() {
         val app = getApplication<Application>()
-        val status = _shiftStatus.value
+        val status = run {
+            val current = _shiftStatus.value
+            if (tickerShiftStatusOverride != null || current is ShiftStatus.Active) {
+                current
+            } else {
+                val loadedShifts = if (_hasLiveShiftSnapshot.value) _liveShifts.value else shifts.value
+                if (loadedShifts.isNotEmpty()) {
+                    ShiftManager.calculateShiftStatus(loadedShifts).also { recalculated ->
+                        if (_shiftStatus.value != recalculated) _shiftStatus.value = recalculated
+                    }
+                } else {
+                    current
+                }
+            }
+        }
         if (isUpdatingOnlineStatus) return
 
         viewModelScope.launch {
-            isUpdatingOnlineStatus = true
+            setUpdatingOnlineStatus(true)
             try {
                 val currentlyOnline = repository.getCaptain()?.isOnline ?: (captainState.value?.isOnline == true)
                 val isApproved = repository.accountApprovalState.value == null || repository.isCurrentSessionApproved
@@ -1405,7 +1426,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                 Log.e("CaptainViewModel", "Unexpected error toggling online status", e)
                 _eventFlow.emit(UiEvent.ShowToast("حدث خطأ أثناء تحديث حالة الاتصال. حاول مرة أخرى."))
             } finally {
-                isUpdatingOnlineStatus = false
+                setUpdatingOnlineStatus(false)
             }
         }
     }
@@ -1429,7 +1450,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         pendingStartWorkAfterGpsEnable = false
         if (isUpdatingOnlineStatus) return
         viewModelScope.launch {
-            isUpdatingOnlineStatus = true
+            setUpdatingOnlineStatus(true)
             try {
                 if (_shiftStatus.value !is ShiftStatus.Active) {
                     _eventFlow.emit(UiEvent.ShowToast("تم منح إذن الموقع. لن يبدأ التتبع قبل بداية الشفت وتأكيد الجاهزية."))
@@ -1441,7 +1462,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                     ineligibleToast = "لا يمكن تشغيل GPS إلا أثناء الشفت النشط."
                 )
             } finally {
-                isUpdatingOnlineStatus = false
+                setUpdatingOnlineStatus(false)
             }
         }
     }
@@ -1714,7 +1735,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                 !isUpdatingOnlineStatus
             ) {
                 viewModelScope.launch {
-                    isUpdatingOnlineStatus = true
+                    setUpdatingOnlineStatus(true)
                     try {
                         activateShiftWorkSafely(
                             app = app,
@@ -1722,7 +1743,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
                             ineligibleToast = "تعذر بدء العمل حالياً. تأكد من اعتماد حسابك ووجود شفت نشط ثم أعد المحاولة."
                         )
                     } finally {
-                        isUpdatingOnlineStatus = false
+                        setUpdatingOnlineStatus(false)
                     }
                 }
             }

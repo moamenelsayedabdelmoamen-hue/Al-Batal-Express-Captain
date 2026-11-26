@@ -1,11 +1,14 @@
 package com.example.ui.navigation
 
 import android.Manifest
+import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import android.widget.Toast
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -158,6 +161,19 @@ fun AppNavigation(
             viewModel.onLocationPermissionGranted()
         } else {
             viewModel.onLocationPermissionDenied()
+            val activity = context as? Activity
+            if (activity != null &&
+                !ActivityCompat.shouldShowRequestPermissionRationale(activity, Manifest.permission.ACCESS_FINE_LOCATION) &&
+                !ActivityCompat.shouldShowRequestPermissionRationale(activity, Manifest.permission.ACCESS_COARSE_LOCATION)
+            ) {
+                runCatching {
+                    val settingsIntent = Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.fromParts("package", context.packageName, null)
+                    )
+                    activity.startActivity(settingsIntent)
+                }
+            }
         }
     }
 
@@ -434,6 +450,7 @@ private fun DashboardTabRoute(
     val currentDayCompletedCount by viewModel.currentDayCompletedCount.collectAsStateWithLifecycle()
     val currentDayWalletBalance by viewModel.currentDayWalletBalance.collectAsStateWithLifecycle()
     val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
+    val isUpdatingOnlineStatus by viewModel.isUpdatingOnlineStatusState.collectAsStateWithLifecycle()
     val gpsStatus by viewModel.gpsStatus.collectAsStateWithLifecycle()
     val currentLocation by viewModel.currentLocation.collectAsStateWithLifecycle()
     val receiptUploadState by viewModel.receiptUploadState.collectAsStateWithLifecycle()
@@ -454,6 +471,7 @@ private fun DashboardTabRoute(
         completedCount = currentDayCompletedCount,
         totalEarnings = currentDayWalletBalance,
         isLoading = isLoading,
+        isUpdatingOnlineStatus = isUpdatingOnlineStatus,
         gpsStatus = gpsStatus,
         currentLocation = currentLocation,
         onRequestLocationPermission = onRequestLocationPermission,

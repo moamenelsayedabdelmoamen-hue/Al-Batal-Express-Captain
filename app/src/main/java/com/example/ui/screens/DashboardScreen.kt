@@ -3,6 +3,7 @@ package com.example.ui.screens
 import android.location.Location
 import android.net.Uri
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -11,6 +12,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -94,6 +96,7 @@ fun DashboardScreen(
     weeklyWorkHours: Double = 0.0,
     isShiftNetworkConnected: Boolean = true,
     isLoading: Boolean = false,
+    isUpdatingOnlineStatus: Boolean = false,
     gpsStatus: GpsStatus = GpsStatus.Inactive,
     currentLocation: Location? = null,
     onRequestLocationPermission: () -> Unit = {},
@@ -226,18 +229,26 @@ fun DashboardScreen(
                         }
                     }
 
-                    // Online/Offline Switch
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        val canConfirmShiftReadiness =
-                            captain?.isOnline == true ||
-                                shiftStatus is ShiftStatus.Active ||
-                                (shiftStatus is ShiftStatus.UpcomingSoon &&
-                                    shiftStatus.millisUntilStart in 1L..(30L * 60_000L))
-                        val isReadyWindow = shiftStatus is ShiftStatus.UpcomingSoon &&
-                            shiftStatus.millisUntilStart in 1L..(30L * 60_000L)
+                    // Online/Offline Switch + Clickable Label
+                    val canConfirmShiftReadiness =
+                        captain?.isOnline == true ||
+                            shiftStatus is ShiftStatus.Active ||
+                            (shiftStatus is ShiftStatus.UpcomingSoon &&
+                                shiftStatus.millisUntilStart in 1L..(30L * 60_000L))
+                    val isReadyWindow = shiftStatus is ShiftStatus.UpcomingSoon &&
+                        shiftStatus.millisUntilStart in 1L..(30L * 60_000L)
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable(enabled = canConfirmShiftReadiness && !isUpdatingOnlineStatus) {
+                                onToggleOnline()
+                            }
+                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                    ) {
                         Switch(
                             checked = captain?.isOnline == true,
-                            enabled = canConfirmShiftReadiness,
+                            enabled = canConfirmShiftReadiness && !isUpdatingOnlineStatus,
                             onCheckedChange = { onToggleOnline() },
                             modifier = Modifier.testTag("online_status_switch"),
                             colors = SwitchDefaults.colors(
@@ -247,24 +258,38 @@ fun DashboardScreen(
                                 uncheckedTrackColor = DarkSurfaceVariant
                             )
                         )
-                        Text(
-                            text = when {
-                                captain?.isOnline == true && isReadyWindow -> "جاهز"
-                                captain?.isOnline == true && shiftStatus is ShiftStatus.Active && gpsStatus is GpsStatus.Active -> "متصل"
-                                captain?.isOnline == true && shiftStatus is ShiftStatus.Active -> "متصل - فعّل الموقع"
-                                shiftStatus is ShiftStatus.Active -> "متصل"
-                                isReadyWindow -> "جاهز"
-                                else -> "غير متصل"
-                            },
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                fontWeight = if (shiftStatus is ShiftStatus.Active) FontWeight.Bold else FontWeight.Normal
-                            ),
-                            color = when {
-                                captain?.isOnline == true && shiftStatus is ShiftStatus.Active && gpsStatus is GpsStatus.Active -> StatusOnlineGreen
-                                (isReadyWindow && captain?.isOnline == true) || shiftStatus is ShiftStatus.Active -> HeroYellow
-                                else -> Color.LightGray
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            if (isUpdatingOnlineStatus) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(12.dp),
+                                    color = HeroYellow,
+                                    strokeWidth = 2.dp
+                                )
                             }
-                        )
+                            Text(
+                                text = when {
+                                    isUpdatingOnlineStatus -> "جاري التفعيل..."
+                                    captain?.isOnline == true && isReadyWindow -> "جاهز"
+                                    captain?.isOnline == true && shiftStatus is ShiftStatus.Active && gpsStatus is GpsStatus.Active -> "متصل"
+                                    captain?.isOnline == true && shiftStatus is ShiftStatus.Active -> "متصل - فعّل الموقع"
+                                    shiftStatus is ShiftStatus.Active -> "متصل"
+                                    isReadyWindow -> "جاهز"
+                                    else -> "غير متصل"
+                                },
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontWeight = if (shiftStatus is ShiftStatus.Active || isUpdatingOnlineStatus) FontWeight.Bold else FontWeight.Normal
+                                ),
+                                color = when {
+                                    isUpdatingOnlineStatus -> HeroYellow
+                                    captain?.isOnline == true && shiftStatus is ShiftStatus.Active && gpsStatus is GpsStatus.Active -> StatusOnlineGreen
+                                    (isReadyWindow && captain?.isOnline == true) || shiftStatus is ShiftStatus.Active -> HeroYellow
+                                    else -> Color.LightGray
+                                }
+                            )
+                        }
                     }
                 }
             }
@@ -661,14 +686,31 @@ fun DashboardScreen(
                         Spacer(modifier = Modifier.height(14.dp))
                         OutlinedButton(
                             onClick = onToggleOnline,
-                            modifier = Modifier.testTag("activate_online_button"),
+                            enabled = !isUpdatingOnlineStatus,
+                            modifier = Modifier
+                                .heightIn(min = 48.dp)
+                                .testTag("activate_online_button"),
                             shape = RoundedCornerShape(12.dp)
                         ) {
-                            Text(
-                                text = if (shiftStatus is ShiftStatus.Active) "متصل" else "تفعيل وضع متصل",
-                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                                color = HeroYellow
-                            )
+                            if (isUpdatingOnlineStatus) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(16.dp),
+                                    color = HeroYellow,
+                                    strokeWidth = 2.dp
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "جاري التفعيل...",
+                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                    color = HeroYellow
+                                )
+                            } else {
+                                Text(
+                                    text = if (shiftStatus is ShiftStatus.Active) "متصل" else "تفعيل وضع متصل",
+                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                    color = HeroYellow
+                                )
+                            }
                         }
                     }
                 }
