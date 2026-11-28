@@ -2156,7 +2156,7 @@ class CaptainViewModel(application: Application) : AndroidViewModel(application)
         customerName: String,
         customerPhone: String,
         notes: String,
-        imageUri: Uri,
+        imageUri: Uri?,
         onSuccess: () -> Unit = {},
         onError: (String) -> Unit = {}
     ) {

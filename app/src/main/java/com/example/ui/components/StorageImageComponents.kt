@@ -46,6 +46,8 @@ import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -185,32 +187,35 @@ fun rememberImageSourceLauncher(
         FirebaseStorageRepository.getInstance(context)
     }
 
-    var showChooserDialog by remember { mutableStateOf(false) }
-    var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
+    var showChooserDialog by rememberSaveable(filePrefix) { mutableStateOf(false) }
+    var pendingCameraUriString by rememberSaveable(filePrefix) { mutableStateOf<String?>(null) }
+    val latestOnImageSelected by rememberUpdatedState(onImageSelected)
 
     val galleryLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri: Uri? ->
         if (uri != null) {
-            onImageSelected(uri)
+            latestOnImageSelected(uri)
         }
     }
 
     val takePictureLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.TakePicture()
     ) { success: Boolean ->
-        val captured = pendingCameraUri
+        val captured = pendingCameraUriString?.let { Uri.parse(it) }
+        pendingCameraUriString = null
         if (success && captured != null) {
-            onImageSelected(captured)
+            latestOnImageSelected(captured)
         }
     }
 
     val launchCameraNow = {
         try {
             val uri = repo.createCameraCaptureUri(context, filePrefix)
-            pendingCameraUri = uri
+            pendingCameraUriString = uri.toString()
             takePictureLauncher.launch(uri)
         } catch (e: Exception) {
+            pendingCameraUriString = null
             Toast.makeText(
                 context,
                 "تعذر فتح الكاميرا: ${e.localizedMessage ?: "يرجى المحاولة من المعرض"}",
@@ -250,6 +255,9 @@ fun rememberImageSourceLauncher(
             PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
         )
     }
+
+    val latestTriggerCamera by rememberUpdatedState(triggerCamera)
+    val latestTriggerGallery by rememberUpdatedState(triggerGallery)
 
     if (showChooserDialog) {
         AlertDialog(
@@ -316,8 +324,8 @@ fun rememberImageSourceLauncher(
     return remember(filePrefix) {
         ImageSourceLauncherState(
             openSourceDialog = { showChooserDialog = true },
-            pickFromGallery = triggerGallery,
-            captureFromCamera = triggerCamera
+            pickFromGallery = { latestTriggerGallery() },
+            captureFromCamera = { latestTriggerCamera() }
         )
     }
 }

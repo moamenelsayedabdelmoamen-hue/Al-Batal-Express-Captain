@@ -109,8 +109,8 @@ class OfficialFirebaseStorageGateway(
         onProgress: (Int) -> Unit
     ) {
         val storage = firebaseStorageProvider().apply {
-            maxUploadRetryTimeMillis = 15_000L
-            maxOperationRetryTimeMillis = 15_000L
+            maxUploadRetryTimeMillis = 45_000L
+            maxOperationRetryTimeMillis = 30_000L
         }
         val ref = storage.reference.child(storagePath)
         val metadataBuilder = StorageMetadata.Builder()
@@ -366,8 +366,30 @@ class FirebaseStorageRepository(
                 "uploadedBy" to currentUid,
                 "category" to "order_receipt"
             ),
+            cleanupTempCameraFile = false,
             onStateChange = onStateChange
         )
+    }
+
+    /**
+     * Safely deletes a temporary photo created by [createCameraCaptureUri] inside `cacheDir/camera_captures`.
+     * Handles both `FileProvider` `content://.../camera_captures/<name>` URIs and direct `file://` URIs.
+     */
+    fun cleanupCameraCaptureFile(imageUri: Uri?) {
+        val uri = imageUri ?: return
+        val ctx = context ?: return
+        runCatching {
+            val rawPath = uri.path.orEmpty()
+            if (!rawPath.contains("/camera_captures/")) return@runCatching
+            val capturesDir = File(ctx.cacheDir, "camera_captures")
+            val fileName = File(rawPath).name
+            if (fileName.isBlank()) return@runCatching
+            val candidate = File(capturesDir, fileName)
+            val capturesCanonical = capturesDir.canonicalPath
+            if (candidate.canonicalPath.startsWith(capturesCanonical + File.separator) && candidate.exists()) {
+                candidate.delete()
+            }
+        }
     }
 
     /**
@@ -474,6 +496,7 @@ class FirebaseStorageRepository(
         imageUri: Uri,
         storagePath: String,
         customMetadata: Map<String, String>,
+        cleanupTempCameraFile: Boolean = true,
         onStateChange: (ImageUploadState) -> Unit
     ): Result<String> = withContext(Dispatchers.IO) {
         val ctx = context ?: return@withContext Result.failure(
@@ -562,11 +585,8 @@ class FirebaseStorageRepository(
                         }
                     }
                     // Clean up temporary camera capture file if source was captured inside cacheDir/camera_captures
-                    runCatching {
-                        val rawPath = imageUri.path.orEmpty()
-                        if (rawPath.contains("/camera_captures/")) {
-                            File(rawPath).takeIf { it.exists() }?.delete()
-                        }
+                    if (cleanupTempCameraFile) {
+                        cleanupCameraCaptureFile(imageUri)
                     }
                     pathVersionCounter[cleanPath] = System.currentTimeMillis()
 

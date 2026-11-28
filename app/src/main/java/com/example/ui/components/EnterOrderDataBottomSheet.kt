@@ -52,6 +52,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -66,6 +67,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.example.data.OrderEntity
+import com.example.data.storage.FirebaseStorageRepository
 import com.example.data.storage.ImageUploadState
 import com.example.ui.theme.DarkBackground
 import com.example.ui.theme.DarkSurface
@@ -82,23 +84,27 @@ fun EnterOrderDataBottomSheet(
     isUploading: Boolean = false,
     receiptUploadState: ImageUploadState = ImageUploadState.Idle,
     onDismiss: () -> Unit,
-    onSaveDataAndImage: (customerName: String, customerPhone: String, notes: String, imageUri: Uri) -> Unit
+    onSaveDataAndImage: (customerName: String, customerPhone: String, notes: String, imageUri: Uri?) -> Unit
 ) {
     val context = LocalContext.current
-    var customerNameInput by remember(order.id) { mutableStateOf(order.customerName) }
-    var customerPhoneInput by remember(order.id) { mutableStateOf(order.customerPhone) }
-    var notesInput by remember(order.id) { mutableStateOf(order.notes) }
-    var selectedLocalReceiptUri by remember(order.id) { mutableStateOf<Uri?>(null) }
-    var validationError by remember { mutableStateOf<String?>(null) }
+    var customerNameInput by rememberSaveable(order.id) { mutableStateOf(order.customerName) }
+    var customerPhoneInput by rememberSaveable(order.id) { mutableStateOf(order.customerPhone) }
+    var notesInput by rememberSaveable(order.id) { mutableStateOf(order.notes) }
+    var selectedLocalReceiptUriString by rememberSaveable(order.id) { mutableStateOf<String?>(null) }
+    val selectedLocalReceiptUri = remember(selectedLocalReceiptUriString) {
+        selectedLocalReceiptUriString?.let { Uri.parse(it) }
+    }
+    var validationError by rememberSaveable(order.id) { mutableStateOf<String?>(null) }
 
     val existingSavedReceipt = order.effectiveReceiptImage
+    val hasExistingStorageReceipt = FirebaseStorageRepository.isFirebaseStoragePath(existingSavedReceipt)
     val isBusy = isUploading || receiptUploadState.isBusy
 
     val receiptSourceLauncher = rememberImageSourceLauncher(
         filePrefix = "order_receipt_${order.id}",
         dialogTitle = "صورة إيصال الطلب"
     ) { uri: Uri ->
-        selectedLocalReceiptUri = uri
+        selectedLocalReceiptUriString = uri.toString()
         validationError = null
     }
 
@@ -113,12 +119,12 @@ fun EnterOrderDataBottomSheet(
             phoneTrimmed.length < 9 -> {
                 validationError = "يرجى إدخال رقم هاتف صحيح للعميل"
             }
-            selectedLocalReceiptUri == null -> {
+            selectedLocalReceiptUri == null && !hasExistingStorageReceipt -> {
                 validationError = "يجب التقاط صورة الإيصال بالكاميرا أو اختيارها من المعرض"
             }
             else -> {
                 validationError = null
-                onSaveDataAndImage(nameTrimmed, phoneTrimmed, notesInput.trim(), selectedLocalReceiptUri!!)
+                onSaveDataAndImage(nameTrimmed, phoneTrimmed, notesInput.trim(), selectedLocalReceiptUri)
             }
         }
     }
@@ -433,7 +439,7 @@ fun EnterOrderDataBottomSheet(
                 Spacer(modifier = Modifier.height(12.dp))
                 UploadStatusBanner(
                     state = receiptUploadState,
-                    onRetry = if (selectedLocalReceiptUri != null) submitAction else null,
+                    onRetry = if (selectedLocalReceiptUri != null || hasExistingStorageReceipt) submitAction else null,
                     tagPrefix = "receipt_upload"
                 )
             }

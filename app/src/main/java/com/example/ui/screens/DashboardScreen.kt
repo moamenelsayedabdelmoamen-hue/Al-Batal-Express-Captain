@@ -50,6 +50,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -105,7 +106,7 @@ fun DashboardScreen(
     onTimeoutOrder: (Long) -> Unit = {},
     onMarkArrivedAtMerchant: (Long) -> Unit = {},
     onConfirmPickup: (Long) -> Unit = {},
-    onSaveOrderCustomerData: (Long, String, String, String, Uri, onSuccess: () -> Unit, onError: (String) -> Unit) -> Unit = { _, _, _, _, _, _, _ -> },
+    onSaveOrderCustomerData: (Long, String, String, String, Uri?, onSuccess: () -> Unit, onError: (String) -> Unit) -> Unit = { _, _, _, _, _, _, _ -> },
     receiptUploadState: ImageUploadState = ImageUploadState.Idle,
     onResetReceiptUploadState: () -> Unit = {},
     orderActionError: OrderActionError? = null,
@@ -118,7 +119,12 @@ fun DashboardScreen(
     onNavigateToShifts: () -> Unit = {}
 ) {
     val scrollState = rememberScrollState()
-    var orderForDataEntry by remember { mutableStateOf<OrderEntity?>(null) }
+    var orderForDataEntryId by rememberSaveable { mutableStateOf<Long?>(null) }
+    val orderForDataEntry = remember(orderForDataEntryId, activeOrder, availableOrders) {
+        orderForDataEntryId?.let { id ->
+            activeOrder?.takeIf { it.id == id } ?: availableOrders.firstOrNull { it.id == id }
+        }
+    }
     var isUploadingOrderImage by remember { mutableStateOf(false) }
     val bottomSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
@@ -537,7 +543,7 @@ fun DashboardScreen(
                     onConfirmPickup = onConfirmPickup,
                     onOpenCustomerDataEntry = {
                         onResetReceiptUploadState()
-                        orderForDataEntry = it
+                        orderForDataEntryId = it.id
                     },
                     onCompleteDelivery = onAdvanceOrderStatus,
                     onSimulateMerchantConfirm = onSimulateMerchantConfirm,
@@ -863,7 +869,7 @@ fun DashboardScreen(
                 onDismiss = {
                     if (!isUploadingOrderImage) {
                         onResetReceiptUploadState()
-                        orderForDataEntry = null
+                        orderForDataEntryId = null
                     }
                 },
                 onSaveDataAndImage = { name, phone, notes, uri ->
@@ -876,7 +882,7 @@ fun DashboardScreen(
                         uri,
                         {
                             isUploadingOrderImage = false
-                            orderForDataEntry = null
+                            orderForDataEntryId = null
                         },
                         { _ ->
                             isUploadingOrderImage = false

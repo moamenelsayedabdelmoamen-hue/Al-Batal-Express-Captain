@@ -256,7 +256,10 @@ class CaptainRepository(
     private var lastOperationalHistorySyncUid: String? = null
     @Volatile
     private var lastOperationalHistorySyncAtMs: Long = 0L
+    @Volatile
+    private var dateBoundedOrdersIndexMissing: Boolean = false
     private val syncedDateKeysCache = ConcurrentHashMap<String, Long>()
+    private val pendingUploadedReceiptPaths = ConcurrentHashMap<String, String>()
 
     @Volatile
     private var activeOrdersListenerUid: String? = null
@@ -1579,7 +1582,10 @@ class CaptainRepository(
         myPhone: String,
         windowStartMs: Long,
         windowEndMs: Long
-    ): Result<Int> {
+    ): Result<Int>? {
+        if (dateBoundedOrdersIndexMissing) {
+            return null
+        }
         val startTs = Timestamp(Date(windowStartMs))
         val endTs = Timestamp(Date(windowEndMs))
         return try {
@@ -1597,11 +1603,16 @@ class CaptainRepository(
         } catch (e: Exception) {
             val fsEx = e as? FirebaseFirestoreException
             if (fsEx?.code == FirebaseFirestoreException.Code.FAILED_PRECONDITION) {
-                Log.e("CaptainRepository", "[HistorySync] Missing composite index; skipping remote sync instead of reading the entire archive.", e)
+                dateBoundedOrdersIndexMissing = true
+                Log.w(
+                    "CaptainRepository",
+                    "[HistorySync] Composite index for date-bounded orders is not configured; falling back to ownership-filtered sync."
+                )
+                null
             } else {
                 Log.w("CaptainRepository", "[HistorySync] Bounded order history query failed", e)
+                Result.failure(e)
             }
-            Result.failure(e)
         }
     }
 
@@ -1639,6 +1650,20 @@ class CaptainRepository(
                 windowStartMs = windowStartMs,
                 windowEndMs = windowEndMs
             )
+
+            if (boundedResult == null) {
+                val fallbackRes = syncCaptainOrdersHistoryInternal(
+                    myUid = myUid,
+                    myPhone = myPhone,
+                    forceRefresh = forceRefresh
+                )
+                if (fallbackRes.isSuccess) {
+                    lastOperationalHistorySyncUid = myUid
+                    lastOperationalHistorySyncAtMs = nowMs
+                    syncedDateKeysCache["$myUid:$currentDayKey"] = nowMs
+                }
+                return@withLock fallbackRes
+            }
 
             syncDailyWalletsSubcollection(myUid)
             reconcileDailyWallets(nowMs)
@@ -1760,11 +1785,23 @@ class CaptainRepository(
                             windowStartMs = dayStartMs - OVERNIGHT_QUERY_BUFFER_MS,
                             windowEndMs = dayEndMs + OVERNIGHT_QUERY_BUFFER_MS
                         )
-                        if (bounded.isSuccess) {
-                            syncedDateKeysCache[cacheKey] = System.currentTimeMillis()
-                            reconcileDailyWallets()
+                        if (bounded == null) {
+                            val fallbackRes = syncCaptainOrdersHistoryInternal(
+                                myUid = myUid,
+                                myPhone = myPhone,
+                                forceRefresh = forceRefresh
+                            )
+                            if (fallbackRes.isSuccess) {
+                                syncedDateKeysCache[cacheKey] = System.currentTimeMillis()
+                            }
+                            fallbackRes
+                        } else {
+                            if (bounded.isSuccess) {
+                                syncedDateKeysCache[cacheKey] = System.currentTimeMillis()
+                                reconcileDailyWallets()
+                            }
+                            bounded
                         }
-                        bounded
                     }
                 }
             }
@@ -1788,6 +1825,7 @@ class CaptainRepository(
         lastFullHistorySyncAtMs = 0L
         lastOperationalHistorySyncUid = null
         lastOperationalHistorySyncAtMs = 0L
+        dateBoundedOrdersIndexMissing = false
         syncedDateKeysCache.clear()
         lastShiftSyncUid = null
         lastShiftSyncAtMs = 0L
@@ -4300,6 +4338,7 @@ class CaptainRepository(
         lastSyncedFcmUid = null
         lastSyncedFcmToken = null
         cachedShiftsByUid = null
+        pendingUploadedReceiptPaths.clear()
         pendingOfflineServerSync = false
         try {
             authBackend.signOut()
@@ -4566,7 +4605,7 @@ class CaptainRepository(
         customerName: String,
         customerPhone: String,
         notes: String,
-        imageUri: Uri,
+        imageUri: Uri?,
         onUploadStateChange: (ImageUploadState) -> Unit = {}
     ): Result<String> {
         val order = orderDao.getOrderById(orderId)
@@ -4587,17 +4626,84 @@ class CaptainRepository(
         }
 
         val orderDocId = resolveCleanOrderDocId(order)
+        val uploadCacheKey = imageUri?.let { "$orderDocId|$it" }
 
-        // Enforce order ownership & explicit allowed lifecycle state before uploading to Firebase Storage
-        val uploadResult = storageRepository.uploadOrderReceiptImage(
-            orderId = orderDocId,
-            assignedCaptainId = normalizedAssignedCaptainId,
-            orderStatus = order.status,
-            imageUri = imageUri,
-            onStateChange = onUploadStateChange
-        )
-        val uploadedStoragePath = uploadResult.getOrElse { err ->
-            return Result.failure(err)
+        val uploadedStoragePath: String
+        val reusedExistingOrCachedPath: Boolean
+
+        if (imageUri == null) {
+            if (normalizedAssignedCaptainId.isBlank() || normalizedAssignedCaptainId.trim() != captainUid) {
+                val ex = com.example.data.storage.StorageUploadException(
+                    "غير مصرح: لا يمكنك تحديث إيصال لطلب غير مسند إليك",
+                    com.example.data.storage.UploadErrorKind.OWNERSHIP_VIOLATION,
+                    false
+                )
+                onUploadStateChange(ImageUploadState.Failed(ex.message ?: "غير مصرح", ex.kind, false))
+                return Result.failure(ex)
+            }
+            if (order.status !in FirebaseStorageRepository.ALLOWED_RECEIPT_UPLOAD_STATUSES) {
+                val ex = com.example.data.storage.StorageUploadException(
+                    "لا يمكن تعديل إيصال الطلب في الحالة الحالية.",
+                    com.example.data.storage.UploadErrorKind.ORDER_CLOSED,
+                    false
+                )
+                onUploadStateChange(ImageUploadState.Failed(ex.message ?: "الطلب مغلق", ex.kind, false))
+                return Result.failure(ex)
+            }
+            val existingReceiptPath = order.effectiveReceiptImage.trim()
+            if (!FirebaseStorageRepository.isFirebaseStoragePath(existingReceiptPath)) {
+                val ex = com.example.data.storage.StorageUploadException(
+                    "يجب التقاط صورة الإيصال بالكاميرا أو اختيارها من المعرض",
+                    com.example.data.storage.UploadErrorKind.VALIDATION,
+                    false
+                )
+                onUploadStateChange(ImageUploadState.Failed(ex.message ?: "صورة الإيصال مطلوبة", ex.kind, false))
+                return Result.failure(ex)
+            }
+            uploadedStoragePath = FirebaseStorageRepository.normalizeStoragePath(existingReceiptPath)
+            reusedExistingOrCachedPath = true
+            onUploadStateChange(ImageUploadState.Uploading(99))
+        } else {
+            val cachedUploadedPath = uploadCacheKey?.let { pendingUploadedReceiptPaths[it] }
+            if (!cachedUploadedPath.isNullOrBlank()) {
+                uploadedStoragePath = cachedUploadedPath
+                reusedExistingOrCachedPath = true
+                onUploadStateChange(ImageUploadState.Uploading(99))
+            } else {
+                // Enforce order ownership & explicit allowed lifecycle state before uploading to Firebase Storage
+                var uploadResult = storageRepository.uploadOrderReceiptImage(
+                    orderId = orderDocId,
+                    assignedCaptainId = normalizedAssignedCaptainId,
+                    orderStatus = order.status,
+                    imageUri = imageUri,
+                    onStateChange = onUploadStateChange
+                )
+                val firstErr = uploadResult.exceptionOrNull()
+                if (uploadResult.isFailure &&
+                    order.status == OrderStatus.AT_STORE &&
+                    (firstErr as? com.example.data.storage.StorageUploadException)?.kind ==
+                        com.example.data.storage.UploadErrorKind.PERMISSION_DENIED
+                ) {
+                    // If backend storage.rules requires PICKED_UP before receipt upload, confirm pickup then retry once.
+                    val pickupRes = confirmPickup(orderId)
+                    if (pickupRes.isSuccess) {
+                        uploadResult = storageRepository.uploadOrderReceiptImage(
+                            orderId = orderDocId,
+                            assignedCaptainId = normalizedAssignedCaptainId,
+                            orderStatus = OrderStatus.PICKED_UP,
+                            imageUri = imageUri,
+                            onStateChange = onUploadStateChange
+                        )
+                    }
+                }
+                uploadedStoragePath = uploadResult.getOrElse { err ->
+                    return Result.failure(err)
+                }
+                if (uploadCacheKey != null) {
+                    pendingUploadedReceiptPaths[uploadCacheKey] = uploadedStoragePath
+                }
+                reusedExistingOrCachedPath = false
+            }
         }
 
         val finalServerRes = cloudMetadataPort.submitOrderReceiptDetails(
@@ -4609,6 +4715,13 @@ class CaptainRepository(
         )
 
         return if (finalServerRes.isSuccess) {
+            if (uploadCacheKey != null) {
+                pendingUploadedReceiptPaths.remove(uploadCacheKey)
+            }
+            storageRepository.cleanupCameraCaptureFile(imageUri)
+            if (reusedExistingOrCachedPath) {
+                onUploadStateChange(ImageUploadState.Success(uploadedStoragePath))
+            }
             val nowMs = System.currentTimeMillis()
             orderDao.updateCustomerDetails(
                 orderId = orderId,
@@ -4626,6 +4739,9 @@ class CaptainRepository(
             val serverErr = finalServerRes.exceptionOrNull() ?: Exception("فشل ربط بيانات الإيصال بالطلب على الخادم")
             val cfEx = serverErr as? com.example.data.remote.CloudFunctionException
             if (cfEx != null && cfEx.isNotFound && !cfEx.isEndpointNotFound) {
+                if (uploadCacheKey != null) {
+                    pendingUploadedReceiptPaths.remove(uploadCacheKey)
+                }
                 orderDao.deleteOrderById(orderId)
             }
             onUploadStateChange(
